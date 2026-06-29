@@ -1,53 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { compact, handleEvent } from "./mapping.js";
-import { extractContent, trajectoryPath } from "./transcript.js";
-
-/**
- * Fake tracing surface mirroring the injected @langfuse/tracing helper.
- * Records startObservation calls — including the root OTel span attributes set
- * via `otelSpan.setAttribute` — so the mapping can be asserted without a real
- * OTel provider.
- */
-function fakeTracing() {
-  const observations = [];
-  return {
-    observations,
-    startObservation(name, attributes, opts) {
-      const spanAttrs = {};
-      const obs = {
-        name,
-        attributes,
-        opts,
-        spanAttrs,
-        traceIO: undefined,
-        ended: false,
-        endTime: undefined,
-        otelSpan: {
-          setAttribute(k, v) {
-            spanAttrs[k] = v;
-          },
-        },
-      };
-      observations.push(obs);
-      return {
-        otelSpan: obs.otelSpan,
-        setTraceIO(io) {
-          obs.traceIO = io;
-          return this;
-        },
-        update(u) {
-          Object.assign(obs.attributes, u);
-          return this;
-        },
-        end(t) {
-          obs.ended = true;
-          obs.endTime = t;
-        },
-      };
-    },
-  };
-}
+import {
+  compact,
+  classifyToolType,
+  usageDetails,
+  generationAttributes,
+  toolAttributes,
+  errorAttributes,
+} from "./mapping.js";
+import { extractContent, extractToolIO, trajectoryPath } from "./transcript.js";
 
 test("compact drops undefined and null", () => {
   assert.deepEqual(compact({ a: 1, b: undefined, c: null, d: 0, e: "" }), {
@@ -57,160 +18,60 @@ test("compact drops undefined and null", () => {
   });
 });
 
-test("model.usage maps to a Langfuse generation with usage + cost", () => {
-  const t = fakeTracing();
-  const evt = {
-    type: "model.usage",
-    ts: 1_700_000_000_000,
-    seq: 1,
-    sessionId: "sess-abc",
-    channel: "imessage",
-    agentId: "agent-1",
+test("classifyToolType: retrieval/search tools become retriever", () => {
+  for (const name of [
+    "vector_search",
+    "rag",
+    "semantic_lookup",
+    "knowledge_base",
+    "web_fetch",
+    "grep",
+    "memory_recall",
+  ]) {
+    assert.equal(classifyToolType(name), "retriever", name);
+  }
+  for (const name of ["edit", "bash", "write_file", "send_message", undefined]) {
+    assert.equal(classifyToolType(name), "tool", String(name));
+  }
+});
+
+test("usageDetails maps OpenClaw usage to snake_case, dropping empties", () => {
+  assert.deepEqual(
+    usageDetails({ input: 10, output: 5, cacheRead: 2, cacheWrite: 1, total: 18 }),
+    { input: 10, output: 5, cache_read: 2, cache_write: 1, total: 18 },
+  );
+  assert.deepEqual(usageDetails({ input: 3 }), { input: 3 });
+  assert.deepEqual(usageDetails(), {});
+});
+
+test("generationAttributes carries model + correlation metadata", () => {
+  const attrs = generationAttributes({
+    model: "claude-opus-4-8",
     provider: "anthropic",
-    model: "claude-opus-4-8",
-    usage: {
-      input: 1200,
-      output: 340,
-      cacheRead: 50,
-      cacheWrite: 10,
-      promptTokens: 1250,
-      total: 1540,
-    },
-    context: { limit: 200000, used: 1540 },
-    costUsd: 0.0123,
-    durationMs: 4200,
-  };
-
-  assert.equal(handleEvent(t, evt, console), true);
-  assert.equal(t.observations.length, 1);
-  const gen = t.observations[0];
-
-  assert.equal(gen.opts.asType, "generation");
-  assert.equal("parentSpanContext" in gen.opts, false); // root span -> own trace
-  // trace-level fields set straight on the root span
-  assert.equal(gen.spanAttrs["langfuse.trace.name"], "imessage");
-  assert.equal(gen.spanAttrs["session.id"], "sess-abc");
-
-  assert.equal(gen.name, "claude-opus-4-8");
-  assert.equal(gen.attributes.model, "claude-opus-4-8");
-  assert.deepEqual(gen.attributes.usageDetails, {
-    input: 1200,
-    output: 340,
-    cache_read: 50,
-    cache_write: 10,
-    total: 1540,
+    api: "messages",
+    callId: "c1",
+    runId: "r1",
   });
-  assert.deepEqual(gen.attributes.costDetails, { totalCost: 0.0123 });
-  assert.ok(gen.opts.startTime instanceof Date);
-  assert.equal(gen.opts.startTime.getTime(), 1_700_000_000_000);
-  assert.ok(gen.endTime instanceof Date);
-  assert.equal(gen.endTime.getTime(), 1_700_000_000_000 + 4200);
-  assert.equal(gen.attributes.metadata.contextLimit, 200000);
-  assert.equal(gen.attributes.metadata.promptTokens, 1250);
-  assert.equal(gen.ended, true);
+  assert.equal(attrs.model, "claude-opus-4-8");
+  assert.equal(attrs.metadata.provider, "anthropic");
+  assert.equal(attrs.metadata.callId, "c1");
 });
 
-test("model.usage falls back to sessionKey and tolerates missing fields", () => {
-  const t = fakeTracing();
-  const evt = {
-    type: "model.usage",
-    sessionKey: "key-xyz",
-    usage: { input: 5, output: 7 },
-  };
-  assert.equal(handleEvent(t, evt, console), true);
-  const gen = t.observations[0];
-  assert.equal(gen.spanAttrs["session.id"], "key-xyz");
-  assert.equal(gen.spanAttrs["langfuse.trace.name"], "openclaw");
-  assert.equal(gen.name, "model.usage");
-  assert.equal("model" in gen.attributes, false); // undefined model dropped
-  assert.equal("costDetails" in gen.attributes, false); // no cost -> omitted
-  assert.equal("startTime" in gen.opts, false); // no ts -> omitted
-  assert.deepEqual(gen.attributes.usageDetails, { input: 5, output: 7 });
+test("toolAttributes carries source/owner/paramsSummary", () => {
+  const attrs = toolAttributes({
+    toolSource: "mcp",
+    toolOwner: "my-server",
+    toolCallId: "tc1",
+    paramsSummary: { kind: "object" },
+  });
+  assert.equal(attrs.metadata.toolSource, "mcp");
+  assert.deepEqual(attrs.metadata.paramsSummary, { kind: "object" });
 });
 
-test("model.call.error maps to an ERROR observation", () => {
-  const t = fakeTracing();
-  const evt = {
-    type: "model.call.error",
-    ts: 1_700_000_000_000,
-    sessionId: "sess-err",
-    channel: "telegram",
-    provider: "openai",
-    model: "gpt-x",
-    errorCategory: "timeout",
-    failureKind: "timeout",
-    durationMs: 30000,
-    callId: "call-9",
-    runId: "run-9",
-  };
-  assert.equal(handleEvent(t, evt, console), true);
-  assert.equal(t.observations.length, 1);
-  const e = t.observations[0];
-  assert.equal(e.name, "model.call.error");
-  assert.equal(e.opts.asType, "span");
-  assert.equal(e.attributes.level, "ERROR");
-  assert.equal(e.attributes.statusMessage, "timeout");
-  assert.equal(e.attributes.metadata.errorCategory, "timeout");
-  assert.equal(e.attributes.metadata.callId, "call-9");
-  assert.equal(e.spanAttrs["langfuse.trace.name"], "telegram");
-  assert.equal(e.spanAttrs["session.id"], "sess-err");
-  assert.equal(e.ended, true);
-});
-
-test("unknown event types are ignored", () => {
-  const t = fakeTracing();
-  assert.equal(handleEvent(t, { type: "webhook.received" }, console), false);
-  assert.equal(handleEvent(t, undefined, console), false);
-  assert.equal(t.observations.length, 0);
-});
-
-test("model.usage attaches resolved input/output content to the generation", () => {
-  const t = fakeTracing();
-  const evt = {
-    type: "model.usage",
-    sessionId: "sess-content",
-    model: "claude-opus-4-8",
-    usage: { input: 1, output: 2 },
-  };
-  const resolveContent = (e) => {
-    assert.equal(e.sessionId, "sess-content");
-    return { input: "what is 2+2?", output: "4", sessionInput: "hello" };
-  };
-  assert.equal(handleEvent(t, evt, console, resolveContent), true);
-  const gen = t.observations[0];
-  // Generation carries the turn IO; the trace mirrors it (root span).
-  assert.equal(gen.attributes.input, "what is 2+2?");
-  assert.equal(gen.attributes.output, "4");
-  assert.deepEqual(gen.traceIO, { input: "what is 2+2?", output: "4" });
-});
-
-test("trace IO mirrors the turn input/output", () => {
-  const t = fakeTracing();
-  const evt = { type: "model.usage", sessionId: "s", usage: { input: 1 } };
-  handleEvent(t, evt, console, () => ({ input: "q", output: "a" }));
-  assert.deepEqual(t.observations[0].traceIO, { input: "q", output: "a" });
-});
-
-test("model.usage omits input/output when no resolver / no content", () => {
-  const t = fakeTracing();
-  const evt = { type: "model.usage", sessionId: "s", usage: { input: 1 } };
-  handleEvent(t, evt, console); // no resolver
-  const gen = t.observations[0];
-  assert.equal("input" in gen.attributes, false);
-  assert.equal("output" in gen.attributes, false);
-  assert.equal(gen.traceIO, undefined); // setTraceIO not called when no content
-});
-
-test("content resolver failures never break usage forwarding", () => {
-  const t = fakeTracing();
-  const evt = { type: "model.usage", sessionId: "s", usage: { input: 1 } };
-  const boom = () => {
-    throw new Error("transcript read failed");
-  };
-  assert.equal(handleEvent(t, evt, console, boom), true);
-  const gen = t.observations[0];
-  assert.deepEqual(gen.attributes.usageDetails, { input: 1 });
-  assert.equal("input" in gen.attributes, false);
+test("errorAttributes sets ERROR level + status from category/kind/denied", () => {
+  assert.equal(errorAttributes({ errorCategory: "timeout" }).level, "ERROR");
+  assert.equal(errorAttributes({ errorCategory: "timeout" }).statusMessage, "timeout");
+  assert.equal(errorAttributes({ deniedReason: "policy" }).statusMessage, "policy");
 });
 
 test("extractContent reads the last model.completed turn", () => {
@@ -249,6 +110,83 @@ test("extractContent returns null when nothing usable", () => {
   assert.equal(extractContent("\n\nnot json\n"), null);
 });
 
+test("extractToolIO pulls per-tool input/output from messagesSnapshot", () => {
+  const text = JSON.stringify({
+    type: "model.completed",
+    data: {
+      messagesSnapshot: [
+        { role: "user", content: "find the docs" },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "I'll search." },
+            {
+              type: "toolCall",
+              id: "tc1",
+              name: "vector_search",
+              arguments: { query: "docs" },
+            },
+          ],
+        },
+        {
+          role: "toolResult",
+          toolCallId: "tc1",
+          toolName: "vector_search",
+          content: [{ type: "text", text: "doc A\ndoc B" }],
+          isError: false,
+        },
+      ],
+    },
+  });
+  assert.deepEqual(extractToolIO(text), {
+    tc1: {
+      name: "vector_search",
+      input: '{"query":"docs"}',
+      output: "doc A\ndoc B",
+      isError: false,
+    },
+  });
+});
+
+test("extractToolIO uses the latest (cumulative) snapshot and flags errors", () => {
+  const text = [
+    JSON.stringify({
+      type: "model.completed",
+      data: { messagesSnapshot: [{ role: "user", content: "old" }] },
+    }),
+    JSON.stringify({
+      type: "model.completed",
+      data: {
+        messagesSnapshot: [
+          {
+            role: "assistant",
+            content: [{ type: "toolCall", id: "tc9", name: "bash", arguments: "ls" }],
+          },
+          {
+            role: "toolResult",
+            toolCallId: "tc9",
+            toolName: "bash",
+            content: "command not found",
+            isError: true,
+          },
+        ],
+      },
+    }),
+  ].join("\n");
+  assert.deepEqual(extractToolIO(text), {
+    tc9: { name: "bash", input: "ls", output: "command not found", isError: true },
+  });
+});
+
+test("extractToolIO returns null when no tool activity", () => {
+  const text = JSON.stringify({
+    type: "model.completed",
+    data: { messagesSnapshot: [{ role: "user", content: "hi" }] },
+  });
+  assert.equal(extractToolIO(text), null);
+  assert.equal(extractToolIO("not json"), null);
+});
+
 test("trajectoryPath builds <stateDir>/agents/<agentId>/sessions/<id>.trajectory.jsonl", () => {
   assert.equal(
     trajectoryPath("/state", "main", "abc"),
@@ -258,16 +196,4 @@ test("trajectoryPath builds <stateDir>/agents/<agentId>/sessions/<id>.trajectory
     trajectoryPath("/state", undefined, "abc"),
     "/state/agents/main/sessions/abc.trajectory.jsonl",
   );
-});
-
-test("handler never throws on malformed events", () => {
-  const t = fakeTracing();
-  // Force startObservation to throw; handleEvent should catch + log, not throw.
-  t.startObservation = () => {
-    throw new Error("boom");
-  };
-  let logged = "";
-  const logger = { error: (m) => (logged = m) };
-  assert.equal(handleEvent(t, { type: "model.usage" }, logger), false);
-  assert.match(logged, /handler failed/);
 });

@@ -80,6 +80,75 @@ function parseLine(line) {
   }
 }
 
+/** Flatten a tool-result `content` value (string | array of text blocks) to text. */
+function contentToText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const parts = [];
+    for (const block of content) {
+      if (typeof block === "string") parts.push(block);
+      else if (block && typeof block.text === "string") parts.push(block.text);
+    }
+    if (parts.length > 0) return parts.join("\n");
+  }
+  return undefined;
+}
+
+/**
+ * Pure: extract per-tool input/output from trajectory JSONL text, keyed by the
+ * tool call id (which matches the `toolCallId` on `tool.execution.*` diagnostic
+ * events). We read the LAST `model.completed` entry's `messagesSnapshot`, which
+ * is the cumulative conversation and therefore holds every tool call + result of
+ * the run by the time the run ends.
+ *
+ * In the snapshot, tool inputs live on assistant `toolCall` blocks
+ * ({ id, name, arguments }) and tool outputs live on `toolResult` messages
+ * ({ toolCallId, toolName, content, isError }). Returns a plain object
+ * { [toolCallId]: { name, input, output, isError } } or null when none found.
+ */
+export function extractToolIO(text) {
+  const lines = text.split("\n");
+  let snapshot;
+  // Walk forward; keep the latest snapshot (cumulative, so last wins).
+  for (const line of lines) {
+    const obj = parseLine(line);
+    if (obj?.type === "model.completed" && Array.isArray(obj?.data?.messagesSnapshot)) {
+      snapshot = obj.data.messagesSnapshot;
+    }
+  }
+  if (!snapshot) return null;
+
+  const byId = {};
+  const ensure = (id) => (byId[id] ??= {});
+  for (const msg of snapshot) {
+    if (!msg || typeof msg !== "object") continue;
+    // Tool outputs: dedicated toolResult messages.
+    if (msg.role === "toolResult" && typeof msg.toolCallId === "string") {
+      const entry = ensure(msg.toolCallId);
+      const out = contentToText(msg.content);
+      if (out !== undefined) entry.output = out;
+      if (typeof msg.toolName === "string") entry.name ??= msg.toolName;
+      if (typeof msg.isError === "boolean") entry.isError = msg.isError;
+      continue;
+    }
+    // Tool inputs: assistant toolCall content blocks.
+    const content = msg.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block?.type !== "toolCall" || typeof block.id !== "string") continue;
+      const entry = ensure(block.id);
+      if (typeof block.name === "string") entry.name = block.name;
+      if (block.arguments !== undefined) {
+        entry.input =
+          typeof block.arguments === "string"
+            ? block.arguments
+            : JSON.stringify(block.arguments);
+      }
+    }
+  }
+  return Object.keys(byId).length > 0 ? byId : null;
+}
+
 /**
  * Pure: extract turn content from trajectory JSONL text. Returns
  * { input, output, sessionInput } where `input`/`output` are the latest turn
@@ -109,6 +178,33 @@ export function extractContent(text) {
   return out;
 }
 
+/** Read the trajectory text for an event's session (whole file, or tail window
+ * for long sessions). Returns { tailText, headText } or null. Never throws. */
+function readTrajectoryText(stateDir, evt, logger) {
+  try {
+    const sessionId = evt?.sessionId ?? evt?.sessionKey;
+    if (!sessionId) return null;
+    const file = trajectoryPath(stateDir, evt?.agentId, sessionId);
+    const { size } = statSync(file);
+    if (size <= MAX_READ_BYTES) {
+      const whole = readFileSync(file, "utf8");
+      return { tailText: whole, headText: whole };
+    }
+    return {
+      tailText: readWindow(file, MAX_READ_BYTES, "tail"),
+      headText: readWindow(file, HEAD_READ_BYTES, "head"),
+    };
+  } catch (err) {
+    // File may not exist yet or be mid-write; this is best-effort.
+    logger?.debug?.(
+      `langfuse-bridge: could not read transcript (${
+        err instanceof Error ? err.message : String(err)
+      })`,
+    );
+    return null;
+  }
+}
+
 /**
  * Build a content resolver bound to a state dir. Returns a function that, given
  * a model.usage event, reads the session transcript and returns
@@ -116,28 +212,28 @@ export function extractContent(text) {
  */
 export function makeContentResolver(stateDir, logger) {
   return (evt) => {
-    try {
-      const sessionId = evt?.sessionId ?? evt?.sessionKey;
-      if (!sessionId) return null;
-      const file = trajectoryPath(stateDir, evt?.agentId, sessionId);
-      const { size } = statSync(file);
-      if (size <= MAX_READ_BYTES) {
-        // Whole file: one pass yields current turn + true first prompt.
-        return extractContent(readFileSync(file, "utf8"));
-      }
-      // Long session: take current turn from the tail, first prompt from the head.
-      const tail = extractContent(readWindow(file, MAX_READ_BYTES, "tail"));
-      if (!tail) return null;
-      const head = extractContent(readWindow(file, HEAD_READ_BYTES, "head"));
-      return { ...tail, sessionInput: head?.sessionInput ?? tail.input };
-    } catch (err) {
-      // File may not exist yet or be mid-write; this is best-effort.
-      logger?.debug?.(
-        `langfuse-bridge: could not read transcript content (${
-          err instanceof Error ? err.message : String(err)
-        })`,
-      );
-      return null;
-    }
+    const text = readTrajectoryText(stateDir, evt, logger);
+    if (!text) return null;
+    // For short sessions tail===head (whole file): one pass yields turn + first
+    // prompt. For long sessions: current turn from tail, first prompt from head.
+    const tail = extractContent(text.tailText);
+    if (!tail) return null;
+    if (text.headText === text.tailText) return tail;
+    const head = extractContent(text.headText);
+    return { ...tail, sessionInput: head?.sessionInput ?? tail.input };
+  };
+}
+
+/**
+ * Build a tool-I/O resolver bound to a state dir. Returns a function that, given
+ * an event with a session id, reads the session transcript and returns the
+ * per-tool I/O map { [toolCallId]: { name, input, output, isError } } or null.
+ * Always reads the tail (most recent, cumulative snapshot). Never throws.
+ */
+export function makeToolIOResolver(stateDir, logger) {
+  return (evt) => {
+    const text = readTrajectoryText(stateDir, evt, logger);
+    if (!text) return null;
+    return extractToolIO(text.tailText);
   };
 }

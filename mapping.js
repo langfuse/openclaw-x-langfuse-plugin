@@ -1,24 +1,11 @@
-// Pure mapping from OpenClaw diagnostic events to Langfuse observations.
-//
-// Built on the Langfuse v5 (OpenTelemetry) SDK. The only tracing primitive is
-// `startObservation`, dependency-injected as a `tracing` object so this module
-// can be unit-tested without a real OTel provider or a running gateway.
-//
-// Grouping: each model event becomes a root observation (its own trace), tagged
-// with the OpenClaw session id so a conversation's turns group together in
-// Langfuse's Sessions view. This is the v5 "observations-first" model — unlike
-// the v3 bridge, which coalesced a session into one trace. We keep each turn as
-// a root span because Langfuse only promotes trace-level fields (name,
-// sessionId, input/output) from a trace's root span.
-//
-// Trace-level fields are written straight onto the root OTel span via
-// `setAttribute` (the keys below). We deliberately avoid `propagateAttributes`,
-// which relies on a global OTel context manager we don't register (to stay off
-// the global OTel state OpenClaw's diagnostics-otel owns).
+// Pure mapping helpers: translate OpenClaw diagnostic events into the shapes the
+// Langfuse v5 (OpenTelemetry) SDK expects. These functions hold no state and do
+// no I/O, so they can be unit-tested in isolation. The stateful nesting of
+// observations into per-run traces lives in `tracer.js`.
 
 // Langfuse OTel attribute keys (from @langfuse/core LangfuseOtelSpanAttributes).
-const TRACE_NAME = "langfuse.trace.name";
-const TRACE_SESSION_ID = "session.id";
+export const TRACE_NAME = "langfuse.trace.name";
+export const TRACE_SESSION_ID = "session.id";
 
 /** Drop undefined/null values so we never send empty fields to Langfuse. */
 export function compact(obj) {
@@ -29,8 +16,13 @@ export function compact(obj) {
   return out;
 }
 
-/** Write trace-level name/sessionId onto an observation's root OTel span. */
-function setTraceFields(obs, name, sessionId) {
+/**
+ * Write trace-level name/sessionId onto an observation's root OTel span. We set
+ * these straight on the span (rather than via `propagateAttributes`, which needs
+ * a global OTel context manager we deliberately don't register) so Langfuse
+ * promotes them to the trace. Only meaningful on a trace's root observation.
+ */
+export function setTraceFields(obs, name, sessionId) {
   const span = obs?.otelSpan;
   if (!span || typeof span.setAttribute !== "function") return;
   if (name !== undefined && name !== null) span.setAttribute(TRACE_NAME, name);
@@ -39,125 +31,110 @@ function setTraceFields(obs, name, sessionId) {
   }
 }
 
+// Tool names whose work is retrieval/search — these become Langfuse `retriever`
+// observations so RAG steps render distinctly from ordinary tool calls. Matched
+// case-insensitively as a substring of the tool name.
+const RETRIEVER_NAME_RE =
+  /(search|retriev|rag\b|vector|embed|semantic|lookup|recall|knowledge|grep|memory|index|web[_-]?fetch|fetch[_-]?url|find)/i;
+
 /**
- * Map a `model.usage` diagnostic event to a Langfuse generation. The generation
- * is the root of its own trace, tagged with the session id for grouping.
- *
- * DiagnosticUsageEvent: { type:"model.usage", ts, sessionId?, sessionKey?,
- * channel?, agentId?, provider?, model?, usage:{input,output,cacheRead,
- * cacheWrite,promptTokens,total}, context?:{limit,used}, costUsd?, durationMs? }
+ * Classify a tool by name into a Langfuse observation type: "retriever" for
+ * retrieval/search/RAG tools, "tool" otherwise. The toolSource ("mcp", "core",
+ * etc.) is not used for classification but is carried in metadata.
  */
-export function forwardUsage(tracing, evt, content) {
-  const sessionId = evt.sessionId ?? evt.sessionKey;
-  const usage = evt.usage ?? {};
+export function classifyToolType(toolName) {
+  return typeof toolName === "string" && RETRIEVER_NAME_RE.test(toolName)
+    ? "retriever"
+    : "tool";
+}
 
-  const startTime = typeof evt.ts === "number" ? new Date(evt.ts) : undefined;
-  const endTime =
-    startTime && typeof evt.durationMs === "number"
-      ? new Date(evt.ts + evt.durationMs)
-      : undefined;
+/** Map an OpenClaw usage object to Langfuse usageDetails (snake_case keys). */
+export function usageDetails(usage = {}) {
+  return compact({
+    input: usage.input,
+    output: usage.output,
+    cache_read: usage.cacheRead,
+    cache_write: usage.cacheWrite,
+    total: usage.total,
+  });
+}
 
-  const gen = tracing.startObservation(
-    evt.model ?? "model.usage",
-    compact({
+/** Convert an epoch-ms timestamp to a Date, or undefined. */
+export function toDate(ms) {
+  return typeof ms === "number" ? new Date(ms) : undefined;
+}
+
+/** Attributes for a `generation` observation built from a model.call event. */
+export function generationAttributes(evt) {
+  return compact({
+    model: evt.model,
+    metadata: compact({
+      provider: evt.provider,
+      api: evt.api,
+      transport: evt.transport,
+      callId: evt.callId,
+      runId: evt.runId,
+      contextTokenBudget: evt.contextTokenBudget,
+      contextWindowSource: evt.contextWindowSource,
+    }),
+  });
+}
+
+/** Attributes for a `tool`/`retriever` observation from a tool.execution event. */
+export function toolAttributes(evt) {
+  return compact({
+    metadata: compact({
+      toolSource: evt.toolSource,
+      toolOwner: evt.toolOwner,
+      toolCallId: evt.toolCallId,
+      runId: evt.runId,
+      paramsSummary: evt.paramsSummary,
+    }),
+  });
+}
+
+/** Attributes for the per-run root observation. */
+export function runAttributes(evt) {
+  return compact({
+    metadata: compact({
+      runId: evt.runId,
+      provider: evt.provider,
       model: evt.model,
-      input: content?.input,
-      output: content?.output,
-      usageDetails: compact({
-        input: usage.input,
-        output: usage.output,
-        cache_read: usage.cacheRead,
-        cache_write: usage.cacheWrite,
-        total: usage.total,
-      }),
-      costDetails:
-        typeof evt.costUsd === "number" ? { totalCost: evt.costUsd } : undefined,
-      metadata: compact({
-        channel: evt.channel,
-        agentId: evt.agentId,
-        provider: evt.provider,
-        promptTokens: usage.promptTokens,
-        contextLimit: evt.context?.limit,
-        contextUsed: evt.context?.used,
-        durationMs: evt.durationMs,
-      }),
+      trigger: evt.trigger,
+      channel: evt.channel,
     }),
-    compact({ asType: "generation", startTime }),
-  );
-
-  setTraceFields(gen, evt.channel ?? "openclaw", sessionId);
-
-  // Mirror the turn's IO onto the trace so it shows at the trace level too.
-  const traceIO = compact({ input: content?.input, output: content?.output });
-  if (Object.keys(traceIO).length > 0) gen.setTraceIO(traceIO);
-
-  gen.end(endTime);
+  });
 }
 
-/**
- * Map a `model.call.error` diagnostic event to a Langfuse error observation.
- * Modeled as a span (not an `event`, which auto-ends before we can attach
- * trace-level fields) carrying ERROR level + failure metadata.
- */
-export function forwardError(tracing, evt) {
-  const sessionId = evt.sessionId ?? evt.sessionKey;
-
-  const span = tracing.startObservation(
-    "model.call.error",
-    compact({
-      level: "ERROR",
-      statusMessage: evt.errorCategory ?? evt.failureKind,
-      metadata: compact({
-        provider: evt.provider,
-        model: evt.model,
-        errorCategory: evt.errorCategory,
-        failureKind: evt.failureKind,
-        durationMs: evt.durationMs,
-        callId: evt.callId,
-        runId: evt.runId,
-      }),
+/** Attributes for a `context.assembled` observation. */
+export function contextAttributes(evt) {
+  return compact({
+    metadata: compact({
+      runId: evt.runId,
+      messageCount: evt.messageCount,
+      historyTextChars: evt.historyTextChars,
+      systemPromptChars: evt.systemPromptChars,
+      promptChars: evt.promptChars,
+      promptImages: evt.promptImages,
+      contextTokenBudget: evt.contextTokenBudget,
     }),
-    compact({
-      asType: "span",
-      startTime: typeof evt.ts === "number" ? new Date(evt.ts) : undefined,
-    }),
-  );
-
-  setTraceFields(span, evt.channel ?? "openclaw", sessionId);
-  span.end();
+  });
 }
 
-/**
- * Dispatch a single diagnostic event. Unknown event types are ignored.
- * Returns true if the event was handled (useful for tests).
- */
-export function handleEvent(tracing, evt, logger, resolveContent) {
-  try {
-    switch (evt?.type) {
-      case "model.usage": {
-        let content;
-        if (typeof resolveContent === "function") {
-          try {
-            content = resolveContent(evt);
-          } catch {
-            content = undefined; // content is best-effort; never block usage
-          }
-        }
-        forwardUsage(tracing, evt, content);
-        return true;
-      }
-      case "model.call.error":
-        forwardError(tracing, evt);
-        return true;
-      default:
-        return false;
-    }
-  } catch (err) {
-    logger?.error?.(
-      `langfuse-bridge: handler failed (${evt?.type}): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-    return false;
-  }
+/** Attributes for an ERROR observation (model.call.error / tool.execution.error). */
+export function errorAttributes(evt) {
+  return compact({
+    level: "ERROR",
+    statusMessage: evt.errorCategory ?? evt.failureKind ?? evt.deniedReason,
+    metadata: compact({
+      provider: evt.provider,
+      model: evt.model,
+      errorCategory: evt.errorCategory,
+      errorCode: evt.errorCode,
+      failureKind: evt.failureKind,
+      callId: evt.callId,
+      runId: evt.runId,
+      toolCallId: evt.toolCallId,
+    }),
+  });
 }
