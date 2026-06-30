@@ -69,6 +69,10 @@ export function createTraceEngine(tracing, opts = {}) {
     now = () => Date.now(),
     ttlMs = DEFAULT_TTL_MS,
     maxEntries = DEFAULT_MAX_ENTRIES,
+    // Schedules trace finalization to run after the synchronous event burst, so
+    // the per-session trajectory (which carries prompt/response + tool I/O) has
+    // been written. Injectable for tests; defaults to setImmediate.
+    defer = (fn) => setImmediate(fn),
   } = opts;
 
   // Live observation registry + lookup indexes. An Entry is:
@@ -150,6 +154,13 @@ export function createTraceEngine(tracing, opts = {}) {
       traceId: tid,
       named: Boolean(evt.channel),
       sessioned: Boolean(sessionOf(evt)),
+      // Identity used to locate the session trajectory during finalization.
+      ctx: { sessionId: evt.sessionId, sessionKey: evt.sessionKey, agentId: evt.agentId },
+      children: new Set(),
+      runCompleted: false,
+      ioSet: false,
+      finalizeScheduled: false,
+      endMs: undefined,
       keys: [],
       lastMs: now(),
       ended: false,
@@ -159,7 +170,7 @@ export function createTraceEngine(tracing, opts = {}) {
     return entry;
   }
 
-  /** Fill in the root's name/session once an event carries them (events vary). */
+  /** Fill in the root's name/session/ctx once an event carries them (events vary). */
   function maybeRefreshRoot(root, evt) {
     if (root.ended) return;
     if (!root.named && evt.channel) {
@@ -175,6 +186,9 @@ export function createTraceEngine(tracing, opts = {}) {
       setTraceFields(root.obs, undefined, sessionOf(evt));
       root.sessioned = true;
     }
+    root.ctx.sessionId ??= evt.sessionId;
+    root.ctx.sessionKey ??= evt.sessionKey;
+    root.ctx.agentId ??= evt.agentId;
   }
 
   /**
@@ -197,7 +211,87 @@ export function createTraceEngine(tracing, opts = {}) {
       ended: false,
     };
     register(entry, extraKeys);
+    if (root?.children) root.children.add(entry);
     return entry;
+  }
+
+  /** Build a minimal event for the transcript resolvers from a root's identity. */
+  function probe(root) {
+    return { sessionId: root.ctx.sessionId, sessionKey: root.ctx.sessionKey, agentId: root.ctx.agentId };
+  }
+
+  /** Set the root's trace-level input/output from resolved turn content (once).
+   * Uses this turn's prompt/response (content.input/output), not sessionInput —
+   * each trace is a single turn, so the first-ever session prompt is wrong here. */
+  function setRootIO(root, content) {
+    if (!root || root.ended || root.ioSet || !content) return;
+    const io = compact({ input: content.input, output: content.output });
+    if (Object.keys(io).length === 0) return;
+    try {
+      if (typeof root.obs.setTraceIO === "function") root.obs.setTraceIO(io);
+      root.ioSet = true;
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  /**
+   * Enrich a trace's still-open tool/retriever children with their args+result
+   * from the trajectory and end them. Called once the trajectory is known to be
+   * written (model.usage time / finalization) — NOT at tool-terminal time, when
+   * the model is still mid-turn and the result has not been flushed yet.
+   */
+  function enrichAndEndTools(root) {
+    if (!root || typeof resolveToolIO !== "function") return endOpenTools(root);
+    let toolIO;
+    try {
+      toolIO = resolveToolIO(probe(root));
+    } catch {
+      toolIO = null;
+    }
+    for (const child of [...root.children]) {
+      if (child.ended || (child.kind !== "tool" && child.kind !== "retriever")) continue;
+      const io = child.toolCallId && toolIO ? toolIO[child.toolCallId] : undefined;
+      if (io) {
+        try {
+          child.obs.update(
+            compact({
+              input: io.input,
+              output: io.output,
+              level: io.isError ? "ERROR" : undefined,
+            }),
+          );
+        } catch {
+          /* best-effort */
+        }
+      }
+      endEntry(child, child.completedMs ?? root.endMs ?? now());
+    }
+  }
+
+  /** End any still-open tool/retriever children without enrichment (fallback). */
+  function endOpenTools(root) {
+    for (const child of [...(root?.children ?? [])]) {
+      if (!child.ended && (child.kind === "tool" || child.kind === "retriever")) {
+        endEntry(child, child.completedMs ?? root.endMs ?? now());
+      }
+    }
+  }
+
+  /** Finalize a completed trace: set root IO, enrich+end tools, end the root. */
+  function finalizeTrace(root) {
+    if (!root || root.ended) return;
+    let content;
+    if (typeof resolveContent === "function") {
+      try {
+        content = resolveContent(probe(root));
+      } catch {
+        content = undefined;
+      }
+    }
+    setRootIO(root, content);
+    enrichAndEndTools(root);
+    endEntry(root, root.endMs ?? now());
   }
 
   // --- event handlers --------------------------------------------------------
@@ -209,35 +303,32 @@ export function createTraceEngine(tracing, opts = {}) {
   function onRunCompleted(evt) {
     const root = ensureRoot(evt);
     if (!root) return;
-    let content;
-    if (typeof resolveContent === "function") {
-      try {
-        content = resolveContent(evt);
-      } catch {
-        content = undefined;
-      }
-    }
+    root.runCompleted = true;
+    root.endMs = evt.ts;
     try {
       root.obs.update(
         compact({ metadata: compact({ outcome: evt.outcome, durationMs: evt.durationMs }) }),
       );
-      const io = compact({ input: content?.sessionInput, output: content?.output });
-      if (Object.keys(io).length > 0 && typeof root.obs.setTraceIO === "function") {
-        root.obs.setTraceIO(io);
-      }
     } catch {
       // best-effort
     }
-    // Soft-end: fix the root's duration but keep it resolvable — model.usage and
-    // other events arrive *after* run.completed and must still attach here.
-    endEntry(root, evt.ts, true);
+    // Defer finalization: the trajectory (prompt/response + tool I/O) is written
+    // around turn end, and model.usage — which finalizes inline — arrives just
+    // after this synchronous run.completed. This deferred pass is the safety net
+    // for turns that emit no usage; it no-ops if usage already finalized.
+    if (!root.finalizeScheduled) {
+      root.finalizeScheduled = true;
+      defer(() => finalizeTrace(root));
+    }
   }
 
   // The generation is modeled from `model.usage` (the only event carrying tokens
-  // + cost), nested under the turn root. We deliberately ignore model.call.* for
-  // observation creation: those would duplicate the usage generation, and their
-  // span parent is the run while usage's is the harness — so there is no clean
-  // shared subtree to reconstruct anyway.
+  // + cost), nested under the turn root. We ignore model.call.* for observation
+  // creation: those would duplicate the usage generation, and their span parent
+  // is the run while usage's is the harness — no clean shared subtree anyway.
+  //
+  // model.usage arrives just after run.completed, by which point the trajectory
+  // is written — so this is where we reliably populate IO across the trace.
   function onModelUsage(evt) {
     const root = ensureRoot(evt);
     let content;
@@ -268,15 +359,20 @@ export function createTraceEngine(tracing, opts = {}) {
       }),
       startMs: typeof evt.durationMs === "number" ? evt.ts - evt.durationMs : evt.ts,
     });
-    if (!root) {
-      // No traceId (degenerate / dropped): standalone root — mirror IO onto its
-      // own trace, preserving the pre-nesting behavior.
+    endEntry(entry, evt.ts);
+
+    if (root) {
+      setRootIO(root, content);
+      enrichAndEndTools(root); // trajectory is written by now
+      // If the run already finished, this usage is the turn's tail → close out.
+      if (root.runCompleted) endEntry(root, root.endMs ?? evt.ts);
+    } else {
+      // No traceId: standalone generation root — mirror IO onto its own trace.
       const io = compact({ input: content?.input, output: content?.output });
       if (Object.keys(io).length > 0 && typeof entry.obs.setTraceIO === "function") {
         entry.obs.setTraceIO(io);
       }
     }
-    endEntry(entry, evt.ts);
   }
 
   function onModelCallError(evt) {
@@ -305,9 +401,9 @@ export function createTraceEngine(tracing, opts = {}) {
 
   function onToolTerminal(evt) {
     let entry = evt.toolCallId ? byKey.get(evt.toolCallId) : null;
+    const root = ensureRoot(evt);
     if (!entry || entry.ended) {
       // started was dropped: synthesize the span, backdating its start.
-      const root = ensureRoot(evt);
       const asType = classifyToolType(evt.toolName);
       entry = createChild(
         evt,
@@ -324,22 +420,11 @@ export function createTraceEngine(tracing, opts = {}) {
     }
     const isError =
       evt.type === "tool.execution.error" || evt.type === "tool.execution.blocked";
-
-    // Best-effort tool I/O (args + result) from the trajectory, by toolCallId.
-    let io;
-    if (evt.toolCallId && typeof resolveToolIO === "function") {
-      try {
-        io = resolveToolIO(evt)?.[evt.toolCallId];
-      } catch {
-        io = undefined;
-      }
-    }
+    entry.completedMs = evt.ts;
     try {
       entry.obs.update(
         compact({
-          input: io?.input,
-          output: io?.output,
-          level: isError || io?.isError ? "ERROR" : undefined,
+          level: isError ? "ERROR" : undefined,
           statusMessage: evt.errorCategory ?? evt.deniedReason ?? evt.reason,
           metadata: compact({
             durationMs: evt.durationMs,
@@ -352,7 +437,25 @@ export function createTraceEngine(tracing, opts = {}) {
     } catch {
       // best-effort
     }
-    endEntry(entry, evt.ts);
+    // Keep the span OPEN: its args/result land in the trajectory only at turn
+    // end, so I/O enrichment + ending happen at model.usage/finalize time. If
+    // there is no run context to wait on (orphan), enrich and end immediately.
+    if (!root) {
+      let io;
+      if (evt.toolCallId && typeof resolveToolIO === "function") {
+        try {
+          io = resolveToolIO(evt)?.[evt.toolCallId];
+        } catch {
+          io = undefined;
+        }
+      }
+      try {
+        entry.obs.update(compact({ input: io?.input, output: io?.output, level: io?.isError ? "ERROR" : undefined }));
+      } catch {
+        /* best-effort */
+      }
+      endEntry(entry, evt.ts);
+    }
   }
 
   function onContextAssembled(evt) {
@@ -408,20 +511,27 @@ export function createTraceEngine(tracing, opts = {}) {
   }
 
   /**
-   * Backstop for the async event stream: end observations left dangling by
-   * dropped terminal events, and forget soft-ended roots once they go idle.
+   * Backstop for the async event stream: finalize idle roots (enriching tool I/O
+   * before ending, in case the deferred finalize was missed), end any other
+   * dangling observations, and forget already-ended entries once idle.
    */
   function sweep(nowMs = now()) {
     const cutoff = nowMs - ttlMs;
     for (const entry of [...live]) {
       if (entry.lastMs >= cutoff) continue;
       if (entry.ended) forget(entry);
+      else if (entry.kind === "root") finalizeTrace(entry);
       else endEntry(entry, nowMs);
     }
   }
 
-  /** End every live observation (called on shutdown). */
+  /** Finalize/end every live observation (called on shutdown). */
   function flushAll() {
+    for (const entry of [...live]) {
+      if (entry.ended) forget(entry);
+      else if (entry.kind === "root") finalizeTrace(entry);
+    }
+    // End any remaining non-root stragglers (orphans with no root).
     const nowMs = now();
     for (const entry of [...live]) {
       if (entry.ended) forget(entry);
