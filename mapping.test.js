@@ -6,6 +6,7 @@ import {
   usageDetails,
   generationAttributes,
   toolAttributes,
+  contextSummary,
   errorAttributes,
 } from "./mapping.js";
 import { extractContent, extractToolIO, trajectoryPath } from "./transcript.js";
@@ -66,6 +67,15 @@ test("toolAttributes carries source/owner/paramsSummary", () => {
   });
   assert.equal(attrs.metadata.toolSource, "mcp");
   assert.deepEqual(attrs.metadata.paramsSummary, { kind: "object" });
+});
+
+test("contextSummary formats present size fields and skips missing ones", () => {
+  assert.equal(
+    contextSummary({ messageCount: 5, promptChars: 64, systemPromptChars: 30753, contextTokenBudget: 1048576 }),
+    "messages=5 · promptChars=64 · systemPromptChars=30753 · tokenBudget=1048576",
+  );
+  assert.equal(contextSummary({ messageCount: 0 }), "messages=0");
+  assert.equal(contextSummary({}), undefined);
 });
 
 test("errorAttributes sets ERROR level + status from category/kind/denied", () => {

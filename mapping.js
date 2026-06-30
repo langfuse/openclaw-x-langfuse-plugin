@@ -121,6 +121,27 @@ export function contextAttributes(evt) {
   });
 }
 
+/**
+ * Human-readable one-line summary of a `context.assembled` event's sizes, used
+ * as the observation's `output` so the row isn't blank. The event carries only
+ * counts (no text), so this surfaces the numbers that are otherwise buried in
+ * metadata. Returns undefined when there's nothing to summarize.
+ */
+export function contextSummary(evt) {
+  const parts = [];
+  const add = (label, v) => {
+    if (typeof v === "number") parts.push(`${label}=${v}`);
+  };
+  add("messages", evt.messageCount);
+  add("promptChars", evt.promptChars);
+  add("systemPromptChars", evt.systemPromptChars);
+  add("historyTextChars", evt.historyTextChars);
+  add("promptImages", evt.promptImages);
+  add("historyImageBlocks", evt.historyImageBlocks);
+  add("tokenBudget", evt.contextTokenBudget);
+  return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
 /** Attributes for an ERROR observation (model.call.error / tool.execution.error). */
 export function errorAttributes(evt) {
   return compact({

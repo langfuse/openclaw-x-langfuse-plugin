@@ -45,6 +45,7 @@ import {
   toolAttributes,
   runAttributes,
   contextAttributes,
+  contextSummary,
   errorAttributes,
 } from "./mapping.js";
 
@@ -456,7 +457,7 @@ export function createTraceEngine(tracing, opts = {}) {
       createChild(evt, root, {
         name: "context.assembled",
         asType: "span",
-        attributes: contextAttributes(evt),
+        attributes: compact({ ...contextAttributes(evt), output: contextSummary(evt) }),
       }),
       evt.ts,
     );

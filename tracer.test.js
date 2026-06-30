@@ -117,6 +117,10 @@ test("a full turn builds one trace with everything under a single root", () => {
   const kinds = root.children.map((c) => c.opts.asType).sort();
   assert.deepEqual(kinds, ["generation", "retriever", "span"]);
   for (const c of root.children) assert.equal(c.parent, root);
+
+  // context.assembled carries a readable size summary instead of blank I/O.
+  const ctx = t.byName("context.assembled");
+  assert.equal(ctx.attributes.output, "messages=5");
 });
 
 test("the generation (model.usage, post-run.completed) nests under the run's trace", () => {
