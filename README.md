@@ -4,10 +4,11 @@ Forward [OpenClaw](https://openclaw.ai) model-usage diagnostics to
 [Langfuse](https://langfuse.com).
 
 The plugin registers a background service that subscribes to OpenClaw's internal
-diagnostics bus and reconstructs each agent run as a **nested Langfuse trace**:
-one root per run, with a child observation for every model call, tool call, and
-retrieval step that happened inside it. Traces are tagged with the OpenClaw
-session id so a conversation's runs group together in Langfuse's Sessions view.
+diagnostics bus and reconstructs each turn as a **nested Langfuse trace**: one
+root per turn (grouped by the W3C trace id OpenClaw stamps on every event), with
+a child observation for every model call, tool call, and retrieval step in it.
+Traces are tagged with the OpenClaw session id so a conversation's turns group
+together in Langfuse's Sessions view.
 
 Crucially, **tool calls and RAG/retrieval steps appear as their own
 observations** (`tool` and `retriever` types) nested under the run — so you can
@@ -83,12 +84,16 @@ start — it never blocks the gateway.
 
 ## What gets sent
 
-Each OpenClaw run becomes one Langfuse trace, named after the channel, with
-`session.id` set to the OpenClaw session id so a conversation's runs group in the
-Sessions view. Under that root:
+Each OpenClaw turn becomes one Langfuse trace (keyed by the shared W3C trace id),
+named after the channel, with `session.id` set to the OpenClaw session id so a
+conversation's turns group in the Sessions view. Under that root:
 
-- **Run root** (`agent`) — the whole agent run, with `outcome` and `durationMs`.
-  Its trace-level input/output mirror the turn's prompt and final response.
+- **Turn root** (`agent`) — anchored by `run.started`/`run.completed`, with
+  `outcome` and `durationMs`. Its trace-level input/output mirror the turn's
+  prompt and final response. (OpenClaw's per-event span parents are inconsistent
+  — `model.usage` hangs off the harness span while tools hang off the run span —
+  so children are attached directly to this one root rather than reconstructing
+  that internal chain.)
 - **Generation** — built from `model.usage`: `model`, `usageDetails` (`input`,
   `output`, `cache_read`, `cache_write`, `total`), `costDetails.totalCost` (USD),
   timing, plus provider metadata and the turn's prompt/response text as
@@ -115,11 +120,11 @@ input/output; the structure (which step ran, when, how long) is always present.
 
 OpenClaw delivers `tool.execution.*` and `model.call.*` events asynchronously
 (they're queued and can be dropped under heavy load), while `run.*` and
-`model.usage` are synchronous — so a run's `run.completed` reaches the bridge
-*before* its own tool events. The engine handles this by soft-ending the run
-(fixing its duration) while keeping it resolvable, so late-arriving children
-still nest correctly, and an idle reaper closes any observation orphaned by a
-dropped terminal event.
+`model.usage` are synchronous — so `run.completed` reaches the bridge *before*
+its own tool events, and `model.usage` arrives *after* it. The engine handles
+this by soft-ending the turn root (fixing its duration) while keeping it
+resolvable, so late-arriving children still attach to it, and an idle reaper
+closes any observation orphaned by a dropped terminal event.
 
 ## How it works
 
@@ -139,9 +144,9 @@ api.registerService({
     });
     setLangfuseTracerProvider(provider);
 
-    // The engine keeps per-run state and nests observations: each event resolves
-    // its parent via the W3C `trace` context OpenClaw stamps on every event
-    // (traceId / spanId / parentSpanId), falling back to the runId.
+    // The engine groups observations into one trace per turn, keyed by the W3C
+    // trace id OpenClaw stamps on every event, and attaches model.usage /
+    // tool.execution.* / context.assembled as children of that turn root.
     const engine = createTraceEngine({ startObservation }, { /* resolvers */ });
     const unsubscribe = onInternalDiagnosticEvent((evt) => engine.handle(evt));
     setInterval(() => engine.sweep(), 60_000).unref(); // reap orphans

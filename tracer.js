@@ -1,35 +1,40 @@
-// Stateful nesting engine: turns OpenClaw's flat diagnostic event stream into
-// per-run nested Langfuse traces.
+// Stateful engine: turns OpenClaw's diagnostic event stream into one nested
+// Langfuse trace per turn.
 //
-// Why this exists: OpenClaw emits a rich, hierarchical event stream — run.*,
-// model.call.*, tool.execution.*, context.assembled, model.usage — and every
-// event carries a W3C `trace` context ({ traceId, spanId, parentSpanId }) plus
-// correlation ids (runId / callId / toolCallId). The old bridge ignored all of
-// it and made each `model.usage` its own flat root trace, so tool calls and RAG
-// retrievals (which happen *between* model calls) never appeared. The result:
-// a generation that says "I'll look it up", then the next generation's input
-// magically already contains the retrieved context, with no visible step.
+// Why this exists: OpenClaw emits a rich event stream — run.*, model.call.*,
+// tool.execution.*, context.assembled, model.usage — and stamps a W3C `trace`
+// context ({ traceId, spanId, parentSpanId }) on every event. The old bridge
+// ignored it and made each `model.usage` its own flat root trace, so tool calls
+// and RAG retrievals (which happen between model calls) never appeared: a
+// generation said "I'll look it up", then the next generation's input already
+// contained the retrieved context, with no visible step.
 //
-// This engine rebuilds the tree the runtime already knows about:
+// Grouping key — the W3C traceId. Captured from a live run, one webchat turn's
+// span hierarchy looks like:
 //
-//   run (agent)                         [run.started → run.completed]
-//   ├─ context.assembled (span)         [context.assembled]
-//   ├─ <model> (generation)             [model.call.* + model.usage folds tokens/cost]
-//   ├─ <tool> (tool | retriever)        [tool.execution.*]  — retriever for RAG/search
-//   ├─ <model> (generation)
-//   └─ ...
+//   <message scope>                         (parent=None)   ← shared trace root "D"
+//   └─ harness.run                          (parent=D)
+//      ├─ run                               (parent=harness)
+//      │  ├─ context.assembled              (parent=run)
+//      │  └─ model.call                     (parent=run)
+//      └─ model.usage                       (parent=harness) ← sibling of run, NOT under it
 //
-// Nesting uses Langfuse-generated span ids (the SDK gives no way to force a
-// span's own id), so we use OpenClaw's (spanId, parentSpanId, runId) purely as
-// correlation keys: each created observation is indexed by its OpenClaw spanId,
-// and a child resolves its parent by parentSpanId, falling back to the run root
-// (by runId), then to a session-tagged standalone root.
+// Every event of the turn shares one traceId, but the span *parent* chain is
+// inconsistent (model.usage hangs off the harness, tools/context hang off the
+// run). So we don't try to reconstruct that internal chain. Instead we create
+// one Langfuse root per W3C traceId and hang the interesting observations under
+// it — flat:
 //
-// Robustness: tool/model-call events are async-queued and droppable under load
-// for non-trusted listeners (which we are), so start/complete pairs can orphan.
-// We therefore (a) lazily create the run root and tool spans from whichever
-// event arrives, and (b) run an idle reaper that ends dangling observations so
-// nothing leaks. Every handler is best-effort and never throws into the bus.
+//   <turn> (agent)                          one per W3C traceId
+//   ├─ context.assembled (span)
+//   ├─ <model> (generation)                 from model.usage: tokens + cost + IO
+//   ├─ <tool> (tool | retriever)            from tool.execution.* — retriever for RAG
+//   └─ <model> (generation)
+//
+// The SDK gives no way to set a span's own id, so children are created via
+// `root.startObservation(...)` (Langfuse-generated ids); OpenClaw's traceId is
+// the only correlation key we need. Tool start/terminal pairs match on
+// toolCallId. Every handler is best-effort and never throws into the bus.
 
 import {
   compact,
@@ -67,22 +72,18 @@ export function createTraceEngine(tracing, opts = {}) {
   } = opts;
 
   // Live observation registry + lookup indexes. An Entry is:
-  //   { obs, kind, runId, spanId, keys:[], lastMs, ended, children:Set,
-  //     lastGen, usageFolded, completedMs }
+  //   { obs, kind, traceId, keys:[], lastMs, ended }
   const live = new Set();
-  const spans = new Map(); // ocSpanId -> Entry
-  const byKey = new Map(); // callId|toolCallId -> Entry
-  const runs = new Map(); // runId -> run Entry
+  const roots = new Map(); // W3C traceId -> root Entry
+  const byKey = new Map(); // toolCallId|callId -> child Entry (start↔terminal match)
 
   function touch(entry) {
     entry.lastMs = now();
     return entry;
   }
 
-  /** Index an entry under its OpenClaw span id and any correlation keys. */
   function register(entry, keys = []) {
     live.add(entry);
-    if (entry.spanId) spans.set(entry.spanId, entry);
     for (const k of keys) {
       if (k) {
         entry.keys.push(k);
@@ -93,20 +94,16 @@ export function createTraceEngine(tracing, opts = {}) {
     return entry;
   }
 
-  /** Remove an entry from every index (after it has ended). */
   function forget(entry) {
     live.delete(entry);
-    if (entry.spanId && spans.get(entry.spanId) === entry) spans.delete(entry.spanId);
-    for (const k of entry.keys) {
-      if (byKey.get(k) === entry) byKey.delete(k);
-    }
-    if (entry.runId && runs.get(entry.runId) === entry) runs.delete(entry.runId);
+    for (const k of entry.keys) if (byKey.get(k) === entry) byKey.delete(k);
+    if (entry.traceId && roots.get(entry.traceId) === entry) roots.delete(entry.traceId);
   }
 
   /**
-   * End an observation once. By default it is also dropped from the indexes;
-   * pass `keep` to end the OTel span (fixing its duration) while leaving the
-   * entry registered, so late-arriving async children can still resolve it as a
+   * End an observation once. By default it is dropped from the indexes; pass
+   * `keep` to end the OTel span (fixing its duration) while leaving the entry
+   * registered, so late-arriving events for the same trace still resolve it as a
    * parent. Kept entries are forgotten later by the reaper.
    */
   function endEntry(entry, endTimeMs, keep = false) {
@@ -122,95 +119,96 @@ export function createTraceEngine(tracing, opts = {}) {
 
   function evictOldest() {
     let oldest = null;
-    for (const e of live) {
-      if (!oldest || e.lastMs < oldest.lastMs) oldest = e;
-    }
+    for (const e of live) if (!oldest || e.lastMs < oldest.lastMs) oldest = e;
     if (oldest) endEntry(oldest, now());
   }
 
-  /** Find an entry for an event by its span id, then by callId/toolCallId. */
-  function lookup(evt) {
-    const sid = evt?.trace?.spanId;
-    if (sid && spans.has(sid)) return spans.get(sid);
-    const key = evt?.callId ?? evt?.toolCallId;
-    if (key && byKey.has(key)) return byKey.get(key);
-    return null;
-  }
-
   /**
-   * Get-or-create the run root observation. `runSpanId` is the OpenClaw span id
-   * of the run itself (so children referencing it via parentSpanId resolve here).
+   * Get-or-create the per-turn root observation, keyed by the event's W3C
+   * traceId. Returns null when the event carries no traceId (caller then makes a
+   * standalone root). Refreshes name/session when a later event supplies a better
+   * channel/session than whatever created the root.
    */
-  function ensureRun(evt, runSpanId, startMs) {
-    const runId = evt.runId;
-    if (runId && runs.has(runId)) return touch(runs.get(runId));
-
+  function ensureRoot(evt) {
+    const tid = evt?.trace?.traceId;
+    if (!tid) return null;
+    const existing = roots.get(tid);
+    if (existing) {
+      maybeRefreshRoot(existing, evt);
+      return touch(existing);
+    }
     const name = evt.channel ?? "openclaw run";
     const obs = tracing.startObservation(
       name,
       runAttributes(evt),
-      compact({ asType: "agent", startTime: toDate(startMs ?? evt.ts) }),
+      compact({ asType: "agent", startTime: toDate(evt.ts) }),
     );
     setTraceFields(obs, name, sessionOf(evt));
     const entry = {
       obs,
-      kind: "run",
-      runId,
-      spanId: runSpanId,
+      kind: "root",
+      traceId: tid,
+      named: Boolean(evt.channel),
+      sessioned: Boolean(sessionOf(evt)),
       keys: [],
       lastMs: now(),
       ended: false,
-      children: new Set(),
-      lastGen: null,
     };
     register(entry);
-    if (runId) runs.set(runId, entry);
+    roots.set(tid, entry);
     return entry;
   }
 
-  /** Resolve the parent entry for a child event (parentSpanId → run → none). */
-  function resolveParent(evt) {
-    const parentSpanId = evt?.trace?.parentSpanId;
-    if (parentSpanId && spans.has(parentSpanId)) return spans.get(parentSpanId);
-    if (evt?.runId) return ensureRun(evt, parentSpanId, evt.ts);
-    return null;
+  /** Fill in the root's name/session once an event carries them (events vary). */
+  function maybeRefreshRoot(root, evt) {
+    if (root.ended) return;
+    if (!root.named && evt.channel) {
+      try {
+        root.obs.update({ name: evt.channel });
+        setTraceFields(root.obs, evt.channel, undefined);
+      } catch {
+        /* best-effort */
+      }
+      root.named = true;
+    }
+    if (!root.sessioned && sessionOf(evt)) {
+      setTraceFields(root.obs, undefined, sessionOf(evt));
+      root.sessioned = true;
+    }
   }
 
   /**
-   * Create a child observation under `parent` (or a session-tagged standalone
-   * root when there is no parent). `extraKeys` index it for later completion.
+   * Create a child observation under the turn root (or a session-tagged
+   * standalone root when the event has no traceId). `extraKeys` index it so a
+   * later terminal event can find and finish it.
    */
-  function createChild(evt, parent, { name, asType, attributes, startMs }, extraKeys = []) {
+  function createChild(evt, root, { name, asType, attributes, startMs }, extraKeys = []) {
     const optsObj = compact({ asType, startTime: toDate(startMs ?? evt.ts) });
-    const obs = parent
-      ? parent.obs.startObservation(name, attributes, optsObj)
+    const obs = root
+      ? root.obs.startObservation(name, attributes, optsObj)
       : tracing.startObservation(name, attributes, optsObj);
-    if (!parent) setTraceFields(obs, evt.channel ?? "openclaw", sessionOf(evt));
+    if (!root) setTraceFields(obs, evt.channel ?? "openclaw", sessionOf(evt));
     const entry = {
       obs,
       kind: asType,
-      runId: evt.runId,
-      spanId: evt?.trace?.spanId,
+      traceId: evt?.trace?.traceId,
       keys: [],
       lastMs: now(),
       ended: false,
     };
     register(entry, extraKeys);
-    if (parent?.children) parent.children.add(entry);
     return entry;
   }
 
   // --- event handlers --------------------------------------------------------
 
   function onRunStarted(evt) {
-    ensureRun(evt, evt?.trace?.spanId, evt.ts);
+    ensureRoot(evt); // anchor the turn root; children attach to it
   }
 
   function onRunCompleted(evt) {
-    const run = evt.runId && runs.has(evt.runId) ? runs.get(evt.runId) : resolveParent(evt);
-    if (!run || run.kind !== "run") return;
-
-    // Mirror the turn's final IO onto the run/trace.
+    const root = ensureRoot(evt);
+    if (!root) return;
     let content;
     if (typeof resolveContent === "function") {
       try {
@@ -220,31 +218,28 @@ export function createTraceEngine(tracing, opts = {}) {
       }
     }
     try {
-      run.obs.update(
+      root.obs.update(
         compact({ metadata: compact({ outcome: evt.outcome, durationMs: evt.durationMs }) }),
       );
       const io = compact({ input: content?.sessionInput, output: content?.output });
-      if (Object.keys(io).length > 0 && typeof run.obs.setTraceIO === "function") {
-        run.obs.setTraceIO(io);
+      if (Object.keys(io).length > 0 && typeof root.obs.setTraceIO === "function") {
+        root.obs.setTraceIO(io);
       }
     } catch {
       // best-effort
     }
-    // Soft-end: fix the run span's duration now, but keep the entry registered.
-    // The run's own tool/model events are async-queued and arrive *after* this
-    // (synchronous) run.completed, so they must still resolve this run as parent.
-    // The reaper forgets the entry once it goes idle.
-    endEntry(run, evt.ts, true);
+    // Soft-end: fix the root's duration but keep it resolvable — model.usage and
+    // other events arrive *after* run.completed and must still attach here.
+    endEntry(root, evt.ts, true);
   }
 
   // The generation is modeled from `model.usage` (the only event carrying tokens
-  // + cost), nested under its run. We deliberately do NOT also create a
-  // generation from model.call.started/completed: those are async-queued and
-  // would (a) duplicate the usage generation and (b) race the synchronous
-  // model.usage, since events do not arrive in emission order across that
-  // sync/async boundary. model.call timing lives in the usage metadata instead.
+  // + cost), nested under the turn root. We deliberately ignore model.call.* for
+  // observation creation: those would duplicate the usage generation, and their
+  // span parent is the run while usage's is the harness — so there is no clean
+  // shared subtree to reconstruct anyway.
   function onModelUsage(evt) {
-    const parent = resolveParent(evt); // usage chains under the run via parentSpanId
+    const root = ensureRoot(evt);
     let content;
     if (typeof resolveContent === "function") {
       try {
@@ -253,9 +248,7 @@ export function createTraceEngine(tracing, opts = {}) {
         content = undefined;
       }
     }
-
-    const run = parent && parent.kind === "run" ? parent : null;
-    const entry = createChild(evt, run, {
+    const entry = createChild(evt, root, {
       name: evt.model ?? "model.usage",
       asType: "generation",
       attributes: compact({
@@ -275,9 +268,9 @@ export function createTraceEngine(tracing, opts = {}) {
       }),
       startMs: typeof evt.durationMs === "number" ? evt.ts - evt.durationMs : evt.ts,
     });
-    if (!run) {
-      // No run context (events dropped, or usage-only path): standalone root —
-      // mirror IO onto its own trace, preserving the pre-nesting behavior.
+    if (!root) {
+      // No traceId (degenerate / dropped): standalone root — mirror IO onto its
+      // own trace, preserving the pre-nesting behavior.
       const io = compact({ input: content?.input, output: content?.output });
       if (Object.keys(io).length > 0 && typeof entry.obs.setTraceIO === "function") {
         entry.obs.setTraceIO(io);
@@ -287,40 +280,38 @@ export function createTraceEngine(tracing, opts = {}) {
   }
 
   function onModelCallError(evt) {
-    const parent = resolveParent(evt);
-    const entry = createChild(evt, parent, {
-      name: "model.call.error",
-      asType: "span",
-      attributes: errorAttributes(evt),
-    });
-    endEntry(entry, evt.ts);
+    const root = ensureRoot(evt);
+    endEntry(
+      createChild(evt, root, {
+        name: "model.call.error",
+        asType: "span",
+        attributes: errorAttributes(evt),
+      }),
+      evt.ts,
+    );
   }
 
   function onToolStarted(evt) {
-    const parent = resolveParent(evt);
+    const root = ensureRoot(evt);
     const asType = classifyToolType(evt.toolName);
     const entry = createChild(
       evt,
-      parent,
-      {
-        name: evt.toolName ?? asType,
-        asType,
-        attributes: toolAttributes(evt),
-      },
+      root,
+      { name: evt.toolName ?? asType, asType, attributes: toolAttributes(evt) },
       [evt.toolCallId],
     );
     entry.toolCallId = evt.toolCallId;
   }
 
   function onToolTerminal(evt) {
-    let entry = lookup(evt);
-    if (!entry) {
+    let entry = evt.toolCallId ? byKey.get(evt.toolCallId) : null;
+    if (!entry || entry.ended) {
       // started was dropped: synthesize the span, backdating its start.
-      const parent = resolveParent(evt);
+      const root = ensureRoot(evt);
       const asType = classifyToolType(evt.toolName);
       entry = createChild(
         evt,
-        parent,
+        root,
         {
           name: evt.toolName ?? asType,
           asType,
@@ -331,18 +322,16 @@ export function createTraceEngine(tracing, opts = {}) {
       );
       entry.toolCallId = evt.toolCallId;
     }
-    const isError = evt.type === "tool.execution.error" || evt.type === "tool.execution.blocked";
+    const isError =
+      evt.type === "tool.execution.error" || evt.type === "tool.execution.blocked";
 
-    // Best-effort tool I/O from the trajectory (args + result), keyed by
-    // toolCallId. Tool terminal events are async-queued and typically arrive
-    // after the turn has been flushed to the trajectory, so the result is
-    // usually present by now.
+    // Best-effort tool I/O (args + result) from the trajectory, by toolCallId.
     let io;
     if (evt.toolCallId && typeof resolveToolIO === "function") {
       try {
         io = resolveToolIO(evt)?.[evt.toolCallId];
       } catch {
-        io = undefined; // best-effort
+        io = undefined;
       }
     }
     try {
@@ -367,13 +356,15 @@ export function createTraceEngine(tracing, opts = {}) {
   }
 
   function onContextAssembled(evt) {
-    const parent = resolveParent(evt);
-    const entry = createChild(evt, parent, {
-      name: "context.assembled",
-      asType: "span",
-      attributes: contextAttributes(evt),
-    });
-    endEntry(entry, evt.ts); // instant marker
+    const root = ensureRoot(evt);
+    endEntry(
+      createChild(evt, root, {
+        name: "context.assembled",
+        asType: "span",
+        attributes: contextAttributes(evt),
+      }),
+      evt.ts,
+    );
   }
 
   /** Dispatch a single diagnostic event. Returns true if handled. */
@@ -418,8 +409,7 @@ export function createTraceEngine(tracing, opts = {}) {
 
   /**
    * Backstop for the async event stream: end observations left dangling by
-   * dropped terminal events, and forget soft-ended runs once they go idle (their
-   * span is already closed; this just releases the map entry).
+   * dropped terminal events, and forget soft-ended roots once they go idle.
    */
   function sweep(nowMs = now()) {
     const cutoff = nowMs - ttlMs;
