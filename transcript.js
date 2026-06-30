@@ -206,6 +206,47 @@ function readTrajectoryText(stateDir, evt, logger) {
 }
 
 /**
+ * Pure: extract the ordered assistant turns (one per model call) from the latest
+ * `model.completed` snapshot. Each assistant message in the conversation is one
+ * model call's output: its text, plus the names of any tools it invoked. Used to
+ * give each generation its own output (instead of joining them all together).
+ * Returns an ordered array of { output, toolCalls } or null.
+ */
+export function extractAssistantTurns(text) {
+  const lines = text.split("\n");
+  let snapshot;
+  for (const line of lines) {
+    const obj = parseLine(line);
+    if (obj?.type === "model.completed" && Array.isArray(obj?.data?.messagesSnapshot)) {
+      snapshot = obj.data.messagesSnapshot;
+    }
+  }
+  if (!snapshot) return null;
+
+  const turns = [];
+  for (const msg of snapshot) {
+    if (msg?.role !== "assistant") continue;
+    const c = msg.content;
+    let text = "";
+    const toolCalls = [];
+    if (typeof c === "string") {
+      text = c;
+    } else if (Array.isArray(c)) {
+      for (const b of c) {
+        if (b?.type === "text" && typeof b.text === "string") {
+          text += (text ? "\n" : "") + b.text;
+        } else if (b?.type === "toolCall" && typeof b.name === "string") {
+          toolCalls.push(b.name);
+        }
+      }
+    }
+    const output = text || (toolCalls.length ? `→ called: ${toolCalls.join(", ")}` : "");
+    turns.push({ output, toolCalls });
+  }
+  return turns.length > 0 ? turns : null;
+}
+
+/**
  * Build a content resolver bound to a state dir. Returns a function that, given
  * a model.usage event, reads the session transcript and returns
  * { input, output, sessionInput } or null. Never throws.
@@ -235,5 +276,18 @@ export function makeToolIOResolver(stateDir, logger) {
     const text = readTrajectoryText(stateDir, evt, logger);
     if (!text) return null;
     return extractToolIO(text.tailText);
+  };
+}
+
+/**
+ * Build an assistant-turns resolver bound to a state dir. Returns a function
+ * that, given an event with a session id, returns the ordered per-call assistant
+ * turns ({ output, toolCalls }[]) for the latest model.completed, or null.
+ */
+export function makeAssistantTurnsResolver(stateDir, logger) {
+  return (evt) => {
+    const text = readTrajectoryText(stateDir, evt, logger);
+    if (!text) return null;
+    return extractAssistantTurns(text.tailText);
   };
 }

@@ -94,10 +94,13 @@ conversation's turns group in the Sessions view. Under that root:
   — `model.usage` hangs off the harness span while tools hang off the run span —
   so children are attached directly to this one root rather than reconstructing
   that internal chain.)
-- **Generation** — built from `model.usage`: `model`, `usageDetails` (`input`,
-  `output`, `cache_read`, `cache_write`, `total`), `costDetails.totalCost` (USD),
-  timing, plus provider metadata and the turn's prompt/response text as
-  input/output.
+- **Generations** — one per LLM call (`model.call.*`), in order, so a multi-step
+  run shows each model turn separately interleaved with its tools (instead of all
+  turns collapsed into one). Each generation's `output` is that call's own
+  assistant text; its `input` is the user prompt (first call) or the preceding
+  tool results (later calls). OpenClaw emits only one cumulative `model.usage`
+  per run, so the run's `usageDetails`/`costDetails` are attached to the run's
+  **last** generation.
 - **Tool / Retriever** — one observation per `tool.execution.*`, named after the
   tool. Retrieval/search tools (vector search, RAG, grep, web fetch, memory
   recall, …) are classified as Langfuse `retriever` observations; everything else

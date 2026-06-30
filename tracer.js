@@ -27,14 +27,21 @@
 //
 //   <turn> (agent)                          one per W3C traceId
 //   ├─ context.assembled (span)
-//   ├─ <model> (generation)                 from model.usage: tokens + cost + IO
+//   ├─ <model> (generation)                 one per model.call.* (LLM call)
 //   ├─ <tool> (tool | retriever)            from tool.execution.* — retriever for RAG
 //   └─ <model> (generation)
+//
+// One generation per model call (not one per run): a run makes several LLM calls
+// (call → tools → call → …), so we create a generation from each
+// model.call.started/completed and give it that call's own output text (from the
+// trajectory) instead of joining every call's text into one. OpenClaw emits only
+// ONE cumulative model.usage per run, so its tokens/cost are attached to the
+// run's last generation; model.usage is not its own generation.
 //
 // The SDK gives no way to set a span's own id, so children are created via
 // `root.startObservation(...)` (Langfuse-generated ids); OpenClaw's traceId is
 // the only correlation key we need. Tool start/terminal pairs match on
-// toolCallId. Every handler is best-effort and never throws into the bus.
+// toolCallId, model.call start/complete on span id. Best-effort; never throws.
 
 import {
   compact,
@@ -47,6 +54,7 @@ import {
   contextAttributes,
   contextSummary,
   errorAttributes,
+  generationAttributes,
 } from "./mapping.js";
 
 const DEFAULT_TTL_MS = 5 * 60_000; // end observations idle longer than this
@@ -67,6 +75,7 @@ export function createTraceEngine(tracing, opts = {}) {
     logger,
     resolveContent, // (evt) -> { input, output, sessionInput } | null
     resolveToolIO, // (evt) -> { [toolCallId]: { name, input, output, isError } } | null
+    resolveTurns, // (evt) -> [{ output, toolCalls }] | null  (one per model call)
     now = () => Date.now(),
     ttlMs = DEFAULT_TTL_MS,
     maxEntries = DEFAULT_MAX_ENTRIES,
@@ -205,6 +214,7 @@ export function createTraceEngine(tracing, opts = {}) {
     if (!root) setTraceFields(obs, evt.channel ?? "openclaw", sessionOf(evt));
     const entry = {
       obs,
+      name,
       kind: asType,
       traceId: evt?.trace?.traceId,
       keys: [],
@@ -246,9 +256,11 @@ export function createTraceEngine(tracing, opts = {}) {
     }
   }
 
-  /** Patch a tool/retriever observation with its resolved I/O (best-effort). */
+  /** Patch a tool/retriever observation with its resolved I/O (best-effort).
+   * Stashes the output on the entry so it can seed the next generation's input. */
   function applyToolIO(entry, io) {
     if (!io) return;
+    if (typeof io.output === "string") entry.ioOutput = io.output;
     try {
       entry.obs.update(
         compact({ input: io.input, output: io.output, level: io.isError ? "ERROR" : undefined }),
@@ -274,11 +286,68 @@ export function createTraceEngine(tracing, opts = {}) {
   }
 
   /**
-   * Finalize a completed trace: set root IO, enrich+end any still-open tools, and
-   * end the root span — but KEEP the entry registered (keep=true). The turn's
-   * tool/context events are async-queued and can arrive *after* run.completed and
-   * model.usage; if we forgot the root here they would spawn a second, orphan
-   * trace. The reaper forgets the entry once it finally goes idle.
+   * Assign per-call content to the run's generations and end them. Each model
+   * call is one assistant turn in the trajectory; we map the run's generations
+   * (in creation order) to the last K assistant turns (in order), so each
+   * generation shows its OWN output instead of all of them joined together.
+   *
+   * Inputs: the first generation gets the turn's user prompt; later generations
+   * get the outputs of the tools that ran since the previous generation (the
+   * tool results that actually fed that model call). The run's cumulative
+   * tokens/cost (the single model.usage) are attached to the LAST generation —
+   * per-call usage isn't emitted, so the last call carries the run total.
+   */
+  function assignGenerations(root, content) {
+    const order = [...root.children];
+    const gens = order.filter((c) => c.kind === "generation" && !c.ended);
+    if (gens.length === 0) return;
+    const K = gens.length;
+
+    let turns = null;
+    if (typeof resolveTurns === "function") {
+      try {
+        turns = resolveTurns(probe(root));
+      } catch {
+        turns = null;
+      }
+    }
+    const outputFor = (i) =>
+      turns && turns.length >= K ? turns[turns.length - K + i]?.output : undefined;
+
+    let toolBuf = [];
+    let gi = 0;
+    for (const c of order) {
+      if ((c.kind === "tool" || c.kind === "retriever") && c.ioOutput) {
+        toolBuf.push(`[${c.name}]\n${c.ioOutput}`);
+      } else if (c.kind === "generation" && !c.ended) {
+        const upd = compact({
+          input: gi === 0 ? content?.input : toolBuf.join("\n\n") || undefined,
+          output: outputFor(gi),
+        });
+        if (gi === K - 1 && root.usage) {
+          upd.usageDetails = root.usage.usageDetails;
+          if (typeof root.usage.costUsd === "number") {
+            upd.costDetails = { totalCost: root.usage.costUsd };
+          }
+        }
+        try {
+          c.obs.update(upd);
+        } catch {
+          /* best-effort */
+        }
+        endEntry(c, c.completedMs ?? root.endMs ?? now());
+        toolBuf = [];
+        gi++;
+      }
+    }
+  }
+
+  /**
+   * Finalize a completed trace: set root IO, enrich+end tools, assign per-call
+   * generation content, and end the root span — but KEEP the entry registered
+   * (keep=true). The turn's tool/model.call/context events are async-queued and
+   * can arrive *after* run.completed/model.usage; if we forgot the root here they
+   * would spawn a second, orphan trace. The reaper forgets it once it goes idle.
    */
   function finalizeTrace(root) {
     if (!root || root.ended) return;
@@ -291,7 +360,8 @@ export function createTraceEngine(tracing, opts = {}) {
       }
     }
     setRootIO(root, content);
-    enrichAndEndTools(root);
+    enrichAndEndTools(root); // sets tool ioOutput (used as generation inputs)
+    assignGenerations(root, content);
     endEntry(root, root.endMs ?? now(), true);
   }
 
@@ -323,13 +393,58 @@ export function createTraceEngine(tracing, opts = {}) {
     }
   }
 
-  // The generation is modeled from `model.usage` (the only event carrying tokens
-  // + cost), nested under the turn root. We ignore model.call.* for observation
-  // creation: those would duplicate the usage generation, and their span parent
-  // is the run while usage's is the harness — no clean shared subtree anyway.
-  //
-  // model.usage arrives just after run.completed, by which point the trajectory
-  // is written — so this is where we reliably populate IO across the trace.
+  // Each LLM call is one generation, created from model.call.started/completed
+  // and keyed by its span id (callId is uselessly equal to runId). Per-call
+  // content is assigned at finalize from the trajectory's assistant turns.
+  function onModelCallStarted(evt) {
+    const root = ensureRoot(evt);
+    createChild(
+      evt,
+      root,
+      { name: evt.model ?? "model.call", asType: "generation", attributes: generationAttributes(evt) },
+      [evt.trace?.spanId],
+    );
+  }
+
+  function onModelCallCompleted(evt) {
+    const root = ensureRoot(evt);
+    let entry = evt.trace?.spanId ? byKey.get(evt.trace.spanId) : null;
+    if (!entry || entry.ended) {
+      // started dropped: synthesize the generation, backdating its start.
+      entry = createChild(
+        evt,
+        root,
+        {
+          name: evt.model ?? "model.call",
+          asType: "generation",
+          attributes: generationAttributes(evt),
+          startMs: typeof evt.durationMs === "number" ? evt.ts - evt.durationMs : evt.ts,
+        },
+        [evt.trace?.spanId],
+      );
+    }
+    entry.completedMs = evt.ts;
+    try {
+      entry.obs.update(
+        compact({
+          metadata: compact({
+            durationMs: evt.durationMs,
+            timeToFirstByteMs: evt.timeToFirstByteMs,
+            responseStreamBytes: evt.responseStreamBytes,
+          }),
+        }),
+      );
+    } catch {
+      /* best-effort */
+    }
+    // Keep the generation OPEN: its output text lands in the trajectory only at
+    // turn end, so content is assigned (and the gen ended) at finalize.
+  }
+
+  // model.usage is the single cumulative tokens/cost event per run. It does NOT
+  // become its own generation; instead its totals are recorded on the root and
+  // attached to the run's last generation at finalize. It also reliably marks a
+  // point where the trajectory is written, so we set trace IO here.
   function onModelUsage(evt) {
     const root = ensureRoot(evt);
     let content;
@@ -340,42 +455,35 @@ export function createTraceEngine(tracing, opts = {}) {
         content = undefined;
       }
     }
-    const entry = createChild(evt, root, {
-      name: evt.model ?? "model.usage",
-      asType: "generation",
-      attributes: compact({
-        model: evt.model,
-        input: content?.input,
-        output: content?.output,
-        usageDetails: usageDetails(evt.usage),
-        costDetails:
-          typeof evt.costUsd === "number" ? { totalCost: evt.costUsd } : undefined,
-        metadata: compact({
-          provider: evt.provider,
-          promptTokens: evt.usage?.promptTokens,
-          contextLimit: evt.context?.limit,
-          contextUsed: evt.context?.used,
-          durationMs: evt.durationMs,
-        }),
-      }),
-      startMs: typeof evt.durationMs === "number" ? evt.ts - evt.durationMs : evt.ts,
-    });
-    endEntry(entry, evt.ts);
-
     if (root) {
-      // Trajectory is written by model.usage time: set trace IO and enrich any
-      // tools that already completed. We do NOT end/forget the root here — late
-      // async tool/context events for this turn still need to resolve it (else
-      // they'd spawn a second, orphan trace). The deferred finalize / reaper end
-      // it once the turn is quiet.
+      root.usage = {
+        usageDetails: usageDetails(evt.usage),
+        costUsd: evt.costUsd,
+        model: evt.model,
+      };
       setRootIO(root, content);
       enrichAndEndTools(root);
     } else {
-      // No traceId: standalone generation root — mirror IO onto its own trace.
+      // No traceId (degenerate / dropped run): fall back to a standalone
+      // generation so usage/cost still land somewhere.
+      const entry = createChild(evt, null, {
+        name: evt.model ?? "model.usage",
+        asType: "generation",
+        attributes: compact({
+          model: evt.model,
+          input: content?.input,
+          output: content?.output,
+          usageDetails: usageDetails(evt.usage),
+          costDetails:
+            typeof evt.costUsd === "number" ? { totalCost: evt.costUsd } : undefined,
+        }),
+        startMs: typeof evt.durationMs === "number" ? evt.ts - evt.durationMs : evt.ts,
+      });
       const io = compact({ input: content?.input, output: content?.output });
       if (Object.keys(io).length > 0 && typeof entry.obs.setTraceIO === "function") {
         entry.obs.setTraceIO(io);
       }
+      endEntry(entry, evt.ts);
     }
   }
 
@@ -472,6 +580,12 @@ export function createTraceEngine(tracing, opts = {}) {
           return true;
         case "run.completed":
           onRunCompleted(evt);
+          return true;
+        case "model.call.started":
+          onModelCallStarted(evt);
+          return true;
+        case "model.call.completed":
+          onModelCallCompleted(evt);
           return true;
         case "model.call.error":
           onModelCallError(evt);

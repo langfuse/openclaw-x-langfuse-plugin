@@ -31,7 +31,11 @@ import {
   setLangfuseTracerProvider,
 } from "@langfuse/tracing";
 import { createTraceEngine } from "./tracer.js";
-import { makeContentResolver, makeToolIOResolver } from "./transcript.js";
+import {
+  makeContentResolver,
+  makeToolIOResolver,
+  makeAssistantTurnsResolver,
+} from "./transcript.js";
 
 const DEFAULT_BASE_URL = "https://cloud.langfuse.com";
 
@@ -102,11 +106,13 @@ function createLangfuseBridgeService(getPluginConfig) {
       // trajectory transcript under ctx.stateDir to populate observation IO.
       const resolveContent = makeContentResolver(ctx.stateDir, ctx.logger);
       const resolveToolIO = makeToolIOResolver(ctx.stateDir, ctx.logger);
+      const resolveTurns = makeAssistantTurnsResolver(ctx.stateDir, ctx.logger);
 
       engine = createTraceEngine(tracing, {
         logger: ctx.logger,
         resolveContent,
         resolveToolIO,
+        resolveTurns,
       });
 
       // `onInternalDiagnosticEvent` invokes the listener as
