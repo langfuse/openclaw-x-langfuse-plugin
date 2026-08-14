@@ -228,6 +228,7 @@ export function createTraceEngine(tracing, opts = {}) {
     if (!root || root.ended || root.ioSet || !content) return;
     const io = compact({ input: content.input, output: content.output });
     if (Object.keys(io).length === 0) return;
+    root.obs.update(io);
     try {
       if (typeof root.obs.setTraceIO === "function") root.obs.setTraceIO(io);
       root.ioSet = true;
