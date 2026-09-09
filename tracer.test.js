@@ -123,6 +123,41 @@ test("a full turn builds one trace with everything under a single root", () => {
   assert.equal(ctx.attributes.output, "messages=5");
 });
 
+test("the root observation continues the upstream W3C trace via parentSpanContext", () => {
+  const t = fakeTracing();
+  const { feed } = makeEngine(t, {});
+  // Well-formed W3C ids (32-hex traceId, 16-hex spanId) as stamped by the
+  // OpenClaw gateway after parsing the inbound traceparent.
+  const traceId = "4bf92f3577b34da6a3ce929d0e0e4736";
+  const spanId = "00f067aa0ba902b7";
+  feed([
+    { type: "run.started", ts: 1, runId: "r1", sessionId: "s", channel: "webchat", trace: { traceId, spanId, traceFlags: "01" } },
+    { type: "run.completed", ts: 2, runId: "r1", sessionId: "s", channel: "webchat", outcome: "completed", trace: { traceId, spanId } },
+  ]);
+  const roots = t.roots();
+  assert.equal(roots.length, 1);
+  assert.deepEqual(roots[0].opts.parentSpanContext, {
+    traceId,
+    spanId,
+    traceFlags: 1,
+    isRemote: true,
+  });
+});
+
+test("malformed or short trace ids fall back to a fresh Langfuse-generated trace id", () => {
+  const t = fakeTracing();
+  const { feed } = makeEngine(t, {});
+  // Test-fixture-style short ids (not 32-hex) cannot form a valid OTel
+  // SpanContext — no parentSpanContext is passed, so the SDK mints its own.
+  feed([
+    { type: "run.started", ts: 1, runId: "r1", channel: "webchat", trace: { traceId: "c09b6e7a5c25", spanId: "RUN" } },
+    { type: "run.completed", ts: 2, runId: "r1", channel: "webchat", outcome: "completed" },
+  ]);
+  const roots = t.roots();
+  assert.equal(roots.length, 1);
+  assert.equal(roots[0].opts.parentSpanContext, undefined);
+});
+
 test("the generation (model.usage, post-run.completed) nests under the run's trace", () => {
   const t = fakeTracing();
   const { feed } = makeEngine(t, {

@@ -1,6 +1,6 @@
 {
   "name": "openclaw-x-langfuse-plugin",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Forward OpenClaw model usage diagnostics to Langfuse",
   "type": "module",
   "main": "index.js",

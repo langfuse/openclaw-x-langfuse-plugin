@@ -57,6 +57,37 @@ function sessionOf(evt) {
   return evt?.sessionId ?? evt?.sessionKey;
 }
 
+const TRACE_ID_RE = /^[0-9a-f]{32}$/;
+const SPAN_ID_RE = /^[0-9a-f]{16}$/;
+const TRACE_FLAGS_RE = /^[0-9a-f]{2}$/;
+
+/**
+ * Convert an OpenClaw diagnostic trace context (`evt.trace`, hex-string
+ * traceFlags) into an OTel `SpanContext` for `startObservation`'s
+ * `parentSpanContext` option. Passing it makes the Langfuse trace CONTINUE the
+ * upstream W3C trace (Langfuse trace id == the propagated traceparent trace
+ * id) instead of minting an unrelated one.
+ *
+ * Returns `undefined` when the context is missing or malformed (e.g. no
+ * usable span id): OTel treats an invalid parent context as "no parent" and
+ * would silently fork the trace anyway, so omitting keeps behavior explicit.
+ */
+function toParentSpanContext(trace) {
+  const traceId = trace?.traceId;
+  const spanId = trace?.spanId;
+  if (typeof traceId !== "string" || !TRACE_ID_RE.test(traceId) || /^0+$/.test(traceId)) {
+    return undefined;
+  }
+  if (typeof spanId !== "string" || !SPAN_ID_RE.test(spanId) || /^0+$/.test(spanId)) {
+    return undefined;
+  }
+  const flags =
+    typeof trace.traceFlags === "string" && TRACE_FLAGS_RE.test(trace.traceFlags)
+      ? Number.parseInt(trace.traceFlags, 16)
+      : 1; // sampled — matches OpenClaw's DEFAULT_TRACE_FLAGS ("01")
+  return { traceId, spanId, traceFlags: flags, isRemote: true };
+}
+
 /**
  * Create a trace engine. `tracing` is the injected @langfuse/tracing surface
  * ({ startObservation }); options carry the best-effort transcript resolvers and
@@ -146,7 +177,14 @@ export function createTraceEngine(tracing, opts = {}) {
     const obs = tracing.startObservation(
       name,
       runAttributes(evt),
-      compact({ asType: "agent", startTime: toDate(evt.ts) }),
+      compact({
+        asType: "agent",
+        startTime: toDate(evt.ts),
+        // Continue the upstream W3C trace (from the inbound traceparent) so
+        // the Langfuse trace id equals the propagated trace id. Children
+        // created via root.obs.startObservation inherit it automatically.
+        parentSpanContext: toParentSpanContext(evt?.trace),
+      }),
     );
     setTraceFields(obs, name, sessionOf(evt));
     const entry = {

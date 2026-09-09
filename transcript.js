@@ -4,20 +4,45 @@
 // `model.usage` diagnostic carries usage/cost only; message content is private
 // data handed exclusively to bundled diagnostics services). To still populate
 // the Langfuse generation's input/output, we read OpenClaw's per-session
-// trajectory transcript, which records each turn's `model.completed` entry with
-// `finalPromptText` (input) and `assistantTexts` (output).
+// transcript. Storage locations, tried in order:
 //
-// This is intentionally best-effort: any failure (file missing, not yet
+//   - Current (OpenClaw ≥2026.7): the per-agent SQLite DB
+//     `agents/<id>/agent/openclaw-agent.sqlite`, table `transcript_events`
+//     (one JSON entry per row — same shapes as the JSONL formats below).
+//   - File transcript `agents/<id>/sessions/{sessionId}.jsonl` — an append-only
+//     message log. Each line is `{type:"message", message:{role, content, ...}}`
+//     where user prompts are `role:"user"` messages and replies are
+//     `role:"assistant"` messages with content blocks. Tool calls are assistant
+//     `toolCall` blocks and tool results are `role:"toolResult"` messages
+//     carrying `toolCallId`.
+//   - Legacy: `{sessionId}.trajectory.jsonl` — `model.completed` entries with
+//     `finalPromptText`/`assistantTexts` and a cumulative `messagesSnapshot`.
+//
+// This is intentionally best-effort: any failure (store missing, not yet
 // flushed, format change) returns null and never blocks usage forwarding.
 
 import { openSync, readSync, readFileSync, statSync, closeSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
+
+// node:sqlite ships with Node ≥22.5; required lazily so older runtimes that
+// never reach the SQLite path can still load this module.
+const require = createRequire(import.meta.url);
+let DatabaseSync;
+try {
+  ({ DatabaseSync } = require("node:sqlite"));
+} catch {
+  DatabaseSync = undefined;
+}
 
 // Cap how much of a (potentially long-lived) transcript we read; we only need
 // the tail (most recent turn) and a small head (the session's first prompt).
 const MAX_READ_BYTES = 2_000_000;
 const HEAD_READ_BYTES = 256_000;
+// Row caps for the SQLite path (same role as the byte caps above).
+const TAIL_ROW_LIMIT = 400;
+const HEAD_ROW_LIMIT = 100;
 
 /** Resolve OpenClaw's state dir: ctx.stateDir, then env, then ~/.openclaw. */
 export function resolveStateDir(stateDir) {
@@ -26,15 +51,77 @@ export function resolveStateDir(stateDir) {
   return path.join(homedir(), ".openclaw");
 }
 
-/** Path to a session's trajectory transcript. */
+function sessionsDir(stateDir, agentId) {
+  return path.join(resolveStateDir(stateDir), "agents", agentId || "main", "sessions");
+}
+
+/** Path to a session's primary transcript (current OpenClaw: `{id}.jsonl`). */
+export function transcriptPath(stateDir, agentId, sessionId) {
+  return path.join(sessionsDir(stateDir, agentId), `${sessionId}.jsonl`);
+}
+
+/** Path to a session's legacy trajectory transcript (`{id}.trajectory.jsonl`). */
 export function trajectoryPath(stateDir, agentId, sessionId) {
+  return path.join(sessionsDir(stateDir, agentId), `${sessionId}.trajectory.jsonl`);
+}
+
+/** Path to an agent's state DB (current OpenClaw stores transcripts there). */
+export function agentDbPath(stateDir, agentId) {
   return path.join(
     resolveStateDir(stateDir),
     "agents",
     agentId || "main",
-    "sessions",
-    `${sessionId}.trajectory.jsonl`,
+    "agent",
+    "openclaw-agent.sqlite",
   );
+}
+
+/**
+ * Read a session's transcript rows from the agent SQLite DB. Returns
+ * { tailText, headText } (rows joined as JSONL text) or null when the DB or
+ * session is unavailable. Never throws; readers tolerate concurrent writers
+ * (readonly connection over WAL).
+ */
+function readSqliteTranscript(stateDir, evt, logger) {
+  if (!DatabaseSync) return null;
+  const sessionId = evt?.sessionId ?? evt?.sessionKey;
+  if (!sessionId) return null;
+  const dbFile = agentDbPath(stateDir, evt?.agentId);
+  let db;
+  try {
+    db = new DatabaseSync(dbFile, { readOnly: true });
+    const tailRows = db
+      .prepare(
+        "SELECT event_json FROM transcript_events WHERE session_id = ? ORDER BY seq DESC LIMIT ?",
+      )
+      .all(sessionId, TAIL_ROW_LIMIT);
+    if (!tailRows || tailRows.length === 0) return null;
+    // Query was DESC (newest first); reverse into chronological order.
+    const tailText = tailRows.map((r) => r.event_json).reverse().join("\n");
+    const headRows = db
+      .prepare(
+        "SELECT event_json FROM transcript_events WHERE session_id = ? ORDER BY seq ASC LIMIT ?",
+      )
+      .all(sessionId, HEAD_ROW_LIMIT);
+    const headText =
+      tailRows.length < TAIL_ROW_LIMIT
+        ? tailText // whole session fits in the tail window
+        : headRows.map((r) => r.event_json).join("\n");
+    return { tailText, headText };
+  } catch (err) {
+    logger?.debug?.(
+      `langfuse-bridge: could not read agent db transcript (${
+        err instanceof Error ? err.message : String(err)
+      })`,
+    );
+    return null;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* best-effort */
+    }
+  }
 }
 
 /** Read a byte window of a file as UTF-8 text. `from: "head" | "tail"`. */
@@ -52,8 +139,25 @@ function readWindow(file, maxBytes, from) {
   }
 }
 
-/** Extract a prompt/response from a single parsed trajectory entry. */
+/** Extract a prompt/response from a single parsed transcript entry. Handles
+ * both the current message-log format and the legacy trajectory format. */
 function entryIO(obj) {
+  // Current format: {type:"message", message:{role, content, ...}}.
+  if (obj?.type === "message") {
+    const msg = obj.message;
+    if (!msg || typeof msg !== "object") return {};
+    if (msg.role === "user") {
+      const input = contentToText(msg.content);
+      return input !== undefined ? { input } : {};
+    }
+    if (msg.role === "assistant") {
+      // Only text blocks carry the reply (thinking blocks have no `text`).
+      const output = contentToText(msg.content);
+      return output !== undefined ? { output } : {};
+    }
+    return {};
+  }
+  // Legacy format: model.completed / prompt.submitted entries.
   const data = obj?.data;
   if (!data) return {};
   if (obj.type === "model.completed") {
@@ -95,32 +199,42 @@ function contentToText(content) {
 }
 
 /**
- * Pure: extract per-tool input/output from trajectory JSONL text, keyed by the
+ * Pure: extract per-tool input/output from transcript JSONL text, keyed by the
  * tool call id (which matches the `toolCallId` on `tool.execution.*` diagnostic
- * events). We read the LAST `model.completed` entry's `messagesSnapshot`, which
- * is the cumulative conversation and therefore holds every tool call + result of
- * the run by the time the run ends.
+ * events). Supports both formats:
  *
- * In the snapshot, tool inputs live on assistant `toolCall` blocks
- * ({ id, name, arguments }) and tool outputs live on `toolResult` messages
- * ({ toolCallId, toolName, content, isError }). Returns a plain object
- * { [toolCallId]: { name, input, output, isError } } or null when none found.
+ *   - Current message log: `{type:"message", message:{...}}` lines; tool inputs
+ *     live on assistant `toolCall` blocks ({ id, name, arguments }) and tool
+ *     outputs on `role:"toolResult"` messages ({ toolCallId, toolName, content,
+ *     isError }).
+ *   - Legacy trajectory: the LAST `model.completed` entry's cumulative
+ *     `messagesSnapshot` holds the same message shapes.
+ *
+ * Returns a plain object { [toolCallId]: { name, input, output, isError } } or
+ * null when none found.
  */
 export function extractToolIO(text) {
   const lines = text.split("\n");
   let snapshot;
-  // Walk forward; keep the latest snapshot (cumulative, so last wins).
+  const logged = [];
   for (const line of lines) {
     const obj = parseLine(line);
-    if (obj?.type === "model.completed" && Array.isArray(obj?.data?.messagesSnapshot)) {
+    if (!obj) continue;
+    if (obj.type === "message" && obj.message && typeof obj.message === "object") {
+      logged.push(obj.message);
+      continue;
+    }
+    // Legacy: keep the latest snapshot (cumulative, so last wins).
+    if (obj.type === "model.completed" && Array.isArray(obj?.data?.messagesSnapshot)) {
       snapshot = obj.data.messagesSnapshot;
     }
   }
-  if (!snapshot) return null;
+  const messages = logged.length > 0 ? logged : snapshot;
+  if (!messages) return null;
 
   const byId = {};
   const ensure = (id) => (byId[id] ??= {});
-  for (const msg of snapshot) {
+  for (const msg of messages) {
     if (!msg || typeof msg !== "object") continue;
     // Tool outputs: dedicated toolResult messages.
     if (msg.role === "toolResult" && typeof msg.toolCallId === "string") {
@@ -150,10 +264,11 @@ export function extractToolIO(text) {
 }
 
 /**
- * Pure: extract turn content from trajectory JSONL text. Returns
- * { input, output, sessionInput } where `input`/`output` are the latest turn
- * (for the generation) and `sessionInput` is the first prompt in the text (for
- * trace-level aggregation). Returns null when nothing usable is found.
+ * Pure: extract turn content from transcript JSONL text (current message log
+ * or legacy trajectory). Returns { input, output, sessionInput } where
+ * `input`/`output` are the latest turn (for the generation) and `sessionInput`
+ * is the first prompt in the text (for trace-level aggregation). Returns null
+ * when nothing usable is found.
  */
 export function extractContent(text) {
   const lines = text.split("\n");
@@ -178,13 +293,28 @@ export function extractContent(text) {
   return out;
 }
 
-/** Read the trajectory text for an event's session (whole file, or tail window
- * for long sessions). Returns { tailText, headText } or null. Never throws. */
+/** Read the transcript text for an event's session. Tries the agent SQLite DB
+ * (current storage), then the `{id}.jsonl` file transcript, then the legacy
+ * `{id}.trajectory.jsonl`. Returns { tailText, headText } or null. Never
+ * throws. */
 function readTrajectoryText(stateDir, evt, logger) {
+  const sqlite = readSqliteTranscript(stateDir, evt, logger);
+  if (sqlite) return sqlite;
   try {
     const sessionId = evt?.sessionId ?? evt?.sessionKey;
     if (!sessionId) return null;
-    const file = trajectoryPath(stateDir, evt?.agentId, sessionId);
+    const candidates = [
+      transcriptPath(stateDir, evt?.agentId, sessionId),
+      trajectoryPath(stateDir, evt?.agentId, sessionId),
+    ];
+    const file = candidates.find((f) => {
+      try {
+        return statSync(f).isFile();
+      } catch {
+        return false;
+      }
+    });
+    if (!file) throw new Error("transcript not found");
     const { size } = statSync(file);
     if (size <= MAX_READ_BYTES) {
       const whole = readFileSync(file, "utf8");
