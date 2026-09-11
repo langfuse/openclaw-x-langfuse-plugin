@@ -17,10 +17,15 @@ export function compact(obj) {
 }
 
 /**
- * Write trace-level name/sessionId onto an observation's root OTel span. We set
- * these straight on the span (rather than via `propagateAttributes`, which needs
- * a global OTel context manager we deliberately don't register) so Langfuse
- * promotes them to the trace. Only meaningful on a trace's root observation.
+ * Write trace-level name/sessionId onto an observation's OTel span. We set these
+ * straight on the span rather than via `propagateAttributes`, which propagates
+ * through an active OTel context we deliberately never establish (this bridge
+ * reacts to a flat event stream; there is no call scope to wrap).
+ *
+ * The name is meaningful only on a trace's root observation. The session id is
+ * stamped on every observation: in the v5 observations-first data model
+ * correlating attributes live on each observation, which is exactly what
+ * `propagateAttributes` would have done for children.
  */
 export function setTraceFields(obs, name, sessionId) {
   const span = obs?.otelSpan;
@@ -48,15 +53,40 @@ export function classifyToolType(toolName) {
     : "tool";
 }
 
-/** Map an OpenClaw usage object to Langfuse usageDetails (snake_case keys). */
-export function usageDetails(usage = {}) {
-  return compact({
-    input: usage.input,
-    output: usage.output,
-    cache_read: usage.cacheRead,
-    cache_write: usage.cacheWrite,
-    total: usage.total,
+/**
+ * Map an OpenClaw usage object to Langfuse usageDetails (snake_case keys).
+ * Accepts both usage shapes: the diagnostic events' (`total`, and
+ * `reasoningTokens` on `model.call.completed` since 2026.8) and the transcript
+ * messages' (`totalTokens`). Returns undefined when there is nothing to report.
+ */
+export function usageDetails(usage) {
+  if (!usage || typeof usage !== "object") return undefined;
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+  const details = compact({
+    input: num(usage.input),
+    output: num(usage.output),
+    cache_read: num(usage.cacheRead),
+    cache_write: num(usage.cacheWrite),
+    reasoning: num(usage.reasoningTokens),
+    total: num(usage.total ?? usage.totalTokens),
   });
+  return Object.keys(details).length > 0 ? details : undefined;
+}
+
+/**
+ * Per-call cost recorded on a transcript assistant message
+ * (`message.usage.cost.total`, in USD), or undefined.
+ */
+export function messageCostUsd(usage) {
+  const total = usage?.cost?.total;
+  return typeof total === "number" && Number.isFinite(total) ? total : undefined;
+}
+
+/** Wrap a USD amount as Langfuse costDetails, or undefined. */
+export function costDetails(costUsd) {
+  return typeof costUsd === "number" && Number.isFinite(costUsd)
+    ? { totalCost: costUsd }
+    : undefined;
 }
 
 /** Convert an epoch-ms timestamp to a Date, or undefined. */
@@ -76,6 +106,9 @@ export function generationAttributes(evt) {
       runId: evt.runId,
       contextTokenBudget: evt.contextTokenBudget,
       contextWindowSource: evt.contextWindowSource,
+      // Prompt shape and per-call/per-turn unit, both added in OpenClaw 2026.8.
+      observationUnit: evt.observationUnit,
+      promptStats: evt.promptStats,
     }),
   });
 }

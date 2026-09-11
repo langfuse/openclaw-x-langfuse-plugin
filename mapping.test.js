@@ -4,12 +4,13 @@ import {
   compact,
   classifyToolType,
   usageDetails,
+  messageCostUsd,
+  costDetails,
   generationAttributes,
   toolAttributes,
   contextSummary,
   errorAttributes,
 } from "./mapping.js";
-import { extractContent, extractToolIO, trajectoryPath } from "./transcript.js";
 
 test("compact drops undefined and null", () => {
   assert.deepEqual(compact({ a: 1, b: undefined, c: null, d: 0, e: "" }), {
@@ -42,7 +43,33 @@ test("usageDetails maps OpenClaw usage to snake_case, dropping empties", () => {
     { input: 10, output: 5, cache_read: 2, cache_write: 1, total: 18 },
   );
   assert.deepEqual(usageDetails({ input: 3 }), { input: 3 });
-  assert.deepEqual(usageDetails(), {});
+  assert.equal(usageDetails(), undefined);
+  assert.equal(usageDetails({}), undefined);
+});
+
+test("usageDetails accepts both usage shapes (event and transcript message)", () => {
+  // model.call.completed (OpenClaw 2026.8+) reports reasoning tokens.
+  assert.deepEqual(usageDetails({ input: 4, output: 2, reasoningTokens: 9, total: 15 }), {
+    input: 4,
+    output: 2,
+    reasoning: 9,
+    total: 15,
+  });
+  // A transcript assistant message spells the total `totalTokens`.
+  assert.deepEqual(usageDetails({ input: 7, output: 3, totalTokens: 10 }), {
+    input: 7,
+    output: 3,
+    total: 10,
+  });
+});
+
+test("per-call cost comes from a transcript message's usage.cost.total", () => {
+  assert.equal(messageCostUsd({ input: 1, cost: { total: 0.0042 } }), 0.0042);
+  assert.equal(messageCostUsd({ input: 1 }), undefined);
+  assert.equal(messageCostUsd(undefined), undefined);
+  assert.deepEqual(costDetails(0.5), { totalCost: 0.5 });
+  assert.equal(costDetails(undefined), undefined);
+  assert.equal(costDetails(Number.NaN), undefined);
 });
 
 test("generationAttributes carries model + correlation metadata", () => {
@@ -82,128 +109,4 @@ test("errorAttributes sets ERROR level + status from category/kind/denied", () =
   assert.equal(errorAttributes({ errorCategory: "timeout" }).level, "ERROR");
   assert.equal(errorAttributes({ errorCategory: "timeout" }).statusMessage, "timeout");
   assert.equal(errorAttributes({ deniedReason: "policy" }).statusMessage, "policy");
-});
-
-test("extractContent reads the last model.completed turn", () => {
-  const text = [
-    JSON.stringify({ type: "prompt.submitted", data: { prompt: "old prompt" } }),
-    JSON.stringify({
-      type: "model.completed",
-      data: { finalPromptText: "old prompt", assistantTexts: ["old answer"] },
-    }),
-    JSON.stringify({ type: "prompt.submitted", data: { prompt: "new prompt" } }),
-    JSON.stringify({
-      type: "model.completed",
-      data: { finalPromptText: "new prompt", assistantTexts: ["line1", "line2"] },
-    }),
-    "", // trailing newline
-  ].join("\n");
-  assert.deepEqual(extractContent(text), {
-    input: "new prompt",
-    output: "line1\nline2",
-    sessionInput: "old prompt", // first prompt in the session
-  });
-});
-
-test("extractContent tolerates a truncated leading line and falls back to prompt.submitted", () => {
-  const text = [
-    '{"type":"model.compl', // truncated (windowed read) -> skipped
-    JSON.stringify({ type: "prompt.submitted", data: { prompt: "only prompt" } }),
-  ].join("\n");
-  assert.deepEqual(extractContent(text), {
-    input: "only prompt",
-    sessionInput: "only prompt",
-  });
-});
-
-test("extractContent returns null when nothing usable", () => {
-  assert.equal(extractContent("\n\nnot json\n"), null);
-});
-
-test("extractToolIO pulls per-tool input/output from messagesSnapshot", () => {
-  const text = JSON.stringify({
-    type: "model.completed",
-    data: {
-      messagesSnapshot: [
-        { role: "user", content: "find the docs" },
-        {
-          role: "assistant",
-          content: [
-            { type: "text", text: "I'll search." },
-            {
-              type: "toolCall",
-              id: "tc1",
-              name: "vector_search",
-              arguments: { query: "docs" },
-            },
-          ],
-        },
-        {
-          role: "toolResult",
-          toolCallId: "tc1",
-          toolName: "vector_search",
-          content: [{ type: "text", text: "doc A\ndoc B" }],
-          isError: false,
-        },
-      ],
-    },
-  });
-  assert.deepEqual(extractToolIO(text), {
-    tc1: {
-      name: "vector_search",
-      input: '{"query":"docs"}',
-      output: "doc A\ndoc B",
-      isError: false,
-    },
-  });
-});
-
-test("extractToolIO uses the latest (cumulative) snapshot and flags errors", () => {
-  const text = [
-    JSON.stringify({
-      type: "model.completed",
-      data: { messagesSnapshot: [{ role: "user", content: "old" }] },
-    }),
-    JSON.stringify({
-      type: "model.completed",
-      data: {
-        messagesSnapshot: [
-          {
-            role: "assistant",
-            content: [{ type: "toolCall", id: "tc9", name: "bash", arguments: "ls" }],
-          },
-          {
-            role: "toolResult",
-            toolCallId: "tc9",
-            toolName: "bash",
-            content: "command not found",
-            isError: true,
-          },
-        ],
-      },
-    }),
-  ].join("\n");
-  assert.deepEqual(extractToolIO(text), {
-    tc9: { name: "bash", input: "ls", output: "command not found", isError: true },
-  });
-});
-
-test("extractToolIO returns null when no tool activity", () => {
-  const text = JSON.stringify({
-    type: "model.completed",
-    data: { messagesSnapshot: [{ role: "user", content: "hi" }] },
-  });
-  assert.equal(extractToolIO(text), null);
-  assert.equal(extractToolIO("not json"), null);
-});
-
-test("trajectoryPath builds <stateDir>/agents/<agentId>/sessions/<id>.trajectory.jsonl", () => {
-  assert.equal(
-    trajectoryPath("/state", "main", "abc"),
-    "/state/agents/main/sessions/abc.trajectory.jsonl",
-  );
-  assert.equal(
-    trajectoryPath("/state", undefined, "abc"),
-    "/state/agents/main/sessions/abc.trajectory.jsonl",
-  );
 });
