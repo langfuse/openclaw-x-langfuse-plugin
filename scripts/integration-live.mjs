@@ -8,7 +8,7 @@
 //
 // Run: node scripts/integration-live.mjs <traceId>
 
-import * as bus from "/usr/local/lib/node_modules/openclaw/dist/plugin-sdk/diagnostic-runtime.js";
+import * as bus from "openclaw/plugin-sdk/diagnostic-runtime";
 import pluginEntry from "../index.js";
 
 const traceId = process.argv[2];

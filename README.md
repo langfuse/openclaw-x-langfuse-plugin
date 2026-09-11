@@ -15,11 +15,18 @@ observations** (`tool` and `retriever` types) nested under the run — so you ca
 see the retrieval that fed a generation instead of the context just appearing in
 the next prompt out of nowhere.
 
-Built on the Langfuse **v5 SDK** (OpenTelemetry-based), so traces appear in
-Langfuse's new observations-first ("fast") UI. The Langfuse `SpanProcessor` runs
-on a dedicated, isolated OTel `TracerProvider` (`setLangfuseTracerProvider`) so
-it never touches the global OpenTelemetry state OpenClaw's bundled
-`diagnostics-otel` service owns.
+Built on the Langfuse **v5 SDK** (`@langfuse/tracing` + `@langfuse/otel`, the
+OpenTelemetry-based generation that replaced the v3 client), so traces appear in
+Langfuse's observations-first UI. Following the SDK's documented isolation
+pattern, the Langfuse `SpanProcessor` runs on a dedicated `TracerProvider`
+registered with `setLangfuseTracerProvider` — never the global one, which
+OpenClaw's bundled `diagnostics-otel` service may own. Correlating attributes
+(the session id) are set on every observation, not just the trace, and each
+observation carries its own input/output, matching the v5 data model.
+
+Requires OpenClaw **2026.6.1+**; message content (Input/Output) additionally
+needs **2026.8+**, where the host exposes a session transcript API — see
+[Content](#content-input--output).
 
 It subscribes via the public `onInternalDiagnosticEvent` SDK export. (The
 `ctx.internalDiagnostics.onEvent` capability is privileged — the runtime injects
@@ -98,9 +105,11 @@ conversation's turns group in the Sessions view. Under that root:
   run shows each model turn separately interleaved with its tools (instead of all
   turns collapsed into one). Each generation's `output` is that call's own
   assistant text; its `input` is the user prompt (first call) or the preceding
-  tool results (later calls). OpenClaw emits only one cumulative `model.usage`
-  per run, so the run's `usageDetails`/`costDetails` are attached to the run's
-  **last** generation.
+  tool results (later calls). Tokens and cost are per call, taken from the
+  transcript's own per-message `usage` (which records a per-call cost), falling
+  back to `model.call.completed.usage` (OpenClaw 2026.8+) and finally to the
+  run's single cumulative `model.usage`, which is then attached to the **last**
+  generation.
 - **Tool / Retriever** — one observation per `tool.execution.*`, named after the
   tool. Retrieval/search tools (vector search, RAG, grep, web fetch, memory
   recall, …) are classified as Langfuse `retriever` observations; everything else
@@ -111,13 +120,39 @@ conversation's turns group in the Sessions view. Under that root:
 - **Errors** — `model.call.error` becomes an ERROR observation with the failure
   category/kind.
 
-Message content (prompts, responses, tool arguments and results) is **not**
-delivered to third-party plugins — OpenClaw hands it only to bundled diagnostics
-services. The bridge recovers it best-effort from the per-session trajectory
-transcript
-(`<stateDir>/agents/<agentId>/sessions/<sessionId>.trajectory.jsonl`). If the
-transcript is unavailable, observations are still forwarded with empty
-input/output; the structure (which step ran, when, how long) is always present.
+### Content (Input / Output)
+
+Message content — prompts, responses, tool arguments and results — is **not**
+delivered to third-party plugins. OpenClaw carries it as *private data* on the
+diagnostics bus and injects the listener that receives it
+(`ctx.internalDiagnostics`) only for its own bundled `diagnostics-otel` /
+`diagnostics-prometheus` services. The public event stream this bridge
+subscribes to has structure, timings and usage, but no text.
+
+So the bridge reads the turn back out of the session transcript, from the first
+of these that works:
+
+1. **The host's session transcript API** (`readVisibleSessionTranscriptMessageEntries`
+   from `openclaw/plugin-sdk/session-transcript-runtime`), which reads whatever
+   store the running host uses — the SQLite store at
+   `<stateDir>/agents/<agentId>/agent/openclaw-agent.sqlite` on OpenClaw
+   **2026.8+**. This is the normal path.
+2. **The legacy sidecar**
+   `<stateDir>/agents/<agentId>/sessions/<sessionId>.trajectory.jsonl`, which
+   pre-2026.8 hosts wrote and 2026.8+ no longer produces.
+
+Which one is in use is logged once at startup:
+
+```
+langfuse-bridge: subscribed to diagnostics; exporting nested run traces to
+https://cloud.langfuse.com (content source: session transcript API)
+```
+
+If that line says `legacy trajectory sidecar` on a 2026.8+ host, the transcript
+module could not be loaded (the preceding log line says why — most often a Node
+build whose bundled SQLite OpenClaw rejects) and Input/Output will be empty. The
+structure — which step ran, when, how long, tokens, cost — is always present
+either way; content is strictly best-effort and never blocks forwarding.
 
 ### Robustness
 
@@ -129,6 +164,11 @@ this by soft-ending the turn root (fixing its duration) while keeping it
 resolvable, so late-arriving children still attach to it, and an idle reaper
 closes any observation orphaned by a dropped terminal event.
 
+Because content lives in the session transcript rather than on the event stream,
+a turn is finalized asynchronously, once after the event burst — and the
+transcript is read once per turn, not once per late tool event. Shutdown flushes
+in-flight observations before the exporter closes.
+
 ## How it works
 
 ```js
@@ -137,22 +177,28 @@ import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import { LangfuseSpanProcessor } from "@langfuse/otel";
 import { startObservation, setLangfuseTracerProvider } from "@langfuse/tracing";
 import { createTraceEngine } from "./tracer.js";
+import { loadTranscriptMessageReader, makeTurnResolver } from "./transcript.js";
 
 api.registerService({
   id: "langfuse-bridge",
-  start(ctx) {
+  async start(ctx) {
     // Isolated OTel pipeline -> never touches OpenClaw's global tracer provider.
     const provider = new NodeTracerProvider({
       spanProcessors: [new LangfuseSpanProcessor({ publicKey, secretKey, baseUrl })],
     });
     setLangfuseTracerProvider(provider);
 
+    // Content source: the host's session transcript API when it has one,
+    // otherwise the legacy per-session sidecar under ctx.stateDir.
+    const readMessages = await loadTranscriptMessageReader(ctx.logger);
+    const resolveTurn = makeTurnResolver({ stateDir: ctx.stateDir, readMessages });
+
     // The engine groups observations into one trace per turn, keyed by the W3C
-    // trace id OpenClaw stamps on every event, and attaches model.usage /
-    // tool.execution.* / context.assembled as children of that turn root.
-    const engine = createTraceEngine({ startObservation }, { /* resolvers */ });
+    // trace id OpenClaw stamps on every event, and attaches the model calls,
+    // tool executions and context.assembled as children of that turn root.
+    const engine = createTraceEngine({ startObservation }, { resolveTurn });
     const unsubscribe = onInternalDiagnosticEvent((evt) => engine.handle(evt));
-    setInterval(() => engine.sweep(), 60_000).unref(); // reap orphans
+    setInterval(() => void engine.sweep(), 60_000).unref(); // reap orphans
   },
 });
 ```
@@ -160,6 +206,26 @@ api.registerService({
 > Note: these events are emitted on OpenClaw's reply/delivery path (channel
 > messages, webchat/TUI turns) — not on direct `openclaw agent` CLI runs, which
 > use the embedded runner and don't emit them.
+
+## Development
+
+```bash
+npm install
+npm test             # unit tests: mapping, transcript extraction, trace engine
+```
+
+The unit tests need no OpenClaw install. The end-to-end check does — it drives
+the real plugin entry against the real diagnostics bus and asserts the span tree
+that reaches the wire — so install the host version you want to check against:
+
+```bash
+npm i --no-save openclaw@2026.9.3   # not a declared dependency: the host provides it
+node scripts/integration.mjs        # real bus -> plugin -> captured OTLP
+```
+
+The script seeds a real session transcript in a throwaway state dir, so its
+content half needs a Node whose bundled SQLite OpenClaw accepts (>= 22.22.3 /
+24.15.0 / 25.9.0); on older builds it verifies the legacy-fallback path instead.
 
 ## License
 

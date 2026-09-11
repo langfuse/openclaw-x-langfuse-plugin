@@ -1,23 +1,39 @@
-// Best-effort capture of prompt/response content for a model.usage event.
+// Best-effort recovery of prompt/response and tool I/O for a turn.
 //
-// OpenClaw does not deliver prompt/completion text to third-party plugins (the
-// `model.usage` diagnostic carries usage/cost only; message content is private
-// data handed exclusively to bundled diagnostics services). To still populate
-// the Langfuse generation's input/output, we read OpenClaw's per-session
-// trajectory transcript, which records each turn's `model.completed` entry with
-// `finalPromptText` (input) and `assistantTexts` (output).
+// OpenClaw never hands message content to third-party plugins: prompts,
+// responses, tool arguments and tool results travel as *private data* on the
+// diagnostics bus and are delivered only to the bundled `diagnostics-otel` /
+// `diagnostics-prometheus` services (the runtime injects
+// `ctx.internalDiagnostics` — the only listener that receives private data —
+// solely for those two service ids). The public `onInternalDiagnosticEvent`
+// stream this bridge uses carries structure, timings and usage but no text.
 //
-// This is intentionally best-effort: any failure (file missing, not yet
-// flushed, format change) returns null and never blocks usage forwarding.
+// So we read the turn's content back out of the session transcript. There are
+// two sources, feeding one extractor:
+//
+//   1. The host's transcript API (`readVisibleSessionTranscriptMessageEntries`
+//      from `openclaw/plugin-sdk/session-transcript-runtime`). It reads whatever
+//      store the running host uses — SQLite (`<stateDir>/agents/<agentId>/agent/
+//      openclaw-agent.sqlite`) on OpenClaw >= 2026.8 — and returns the ordered
+//      conversation messages. This is the primary source.
+//   2. The legacy per-session `<sessionId>.trajectory.jsonl` sidecar, which
+//      older hosts wrote next to the session store and 2026.8+ no longer
+//      produces. This is the fallback for pre-2026.8 hosts.
+//
+// Both paths end up in `extractTurnContent`, because the sidecar's
+// `model.completed.messagesSnapshot` holds the same message shapes the
+// transcript API returns.
+//
+// Everything here is best-effort: a missing store, an unavailable SDK module or
+// a format change returns null and never blocks event forwarding.
 
 import { openSync, readSync, readFileSync, statSync, closeSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
-// Cap how much of a (potentially long-lived) transcript we read; we only need
-// the tail (most recent turn) and a small head (the session's first prompt).
+// Cap how much of a (potentially long-lived) legacy sidecar we read; we only
+// need the tail, which holds the most recent cumulative snapshot.
 const MAX_READ_BYTES = 2_000_000;
-const HEAD_READ_BYTES = 256_000;
 
 /** Resolve OpenClaw's state dir: ctx.stateDir, then env, then ~/.openclaw. */
 export function resolveStateDir(stateDir) {
@@ -26,7 +42,7 @@ export function resolveStateDir(stateDir) {
   return path.join(homedir(), ".openclaw");
 }
 
-/** Path to a session's trajectory transcript. */
+/** Path to a session's legacy trajectory sidecar (pre-2026.8 hosts). */
 export function trajectoryPath(stateDir, agentId, sessionId) {
   return path.join(
     resolveStateDir(stateDir),
@@ -37,37 +53,120 @@ export function trajectoryPath(stateDir, agentId, sessionId) {
   );
 }
 
-/** Read a byte window of a file as UTF-8 text. `from: "head" | "tail"`. */
-function readWindow(file, maxBytes, from) {
-  const { size } = statSync(file);
-  if (size <= maxBytes) return readFileSync(file, "utf8");
-  const fd = openSync(file, "r");
+/**
+ * Agent id embedded in a scoped session key (`agent:<agentId>:<rest>`). The
+ * transcript API requires an agent id, and some diagnostic events carry the
+ * session key but not `agentId`.
+ */
+export function agentIdFromSessionKey(sessionKey) {
+  if (typeof sessionKey !== "string") return undefined;
+  const m = /^agent:([^:]+):/.exec(sessionKey);
+  return m ? m[1] : undefined;
+}
+
+/** Flatten message content (string | array of blocks) to plain text. */
+function blocksToText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts = [];
+  for (const block of content) {
+    if (typeof block === "string") parts.push(block);
+    else if (block?.type === "text" && typeof block.text === "string") {
+      parts.push(block.text);
+    }
+  }
+  return parts.join("\n");
+}
+
+/** Serialize tool arguments for an observation's input. */
+function argsToText(args) {
+  if (args === undefined) return undefined;
+  if (typeof args === "string") return args;
   try {
-    const buf = Buffer.allocUnsafe(maxBytes);
-    const start = from === "tail" ? size - maxBytes : 0;
-    const bytes = readSync(fd, buf, 0, maxBytes, start);
-    return buf.toString("utf8", 0, bytes);
-  } finally {
-    closeSync(fd);
+    return JSON.stringify(args);
+  } catch {
+    return undefined;
   }
 }
 
-/** Extract a prompt/response from a single parsed trajectory entry. */
-function entryIO(obj) {
-  const data = obj?.data;
-  if (!data) return {};
-  if (obj.type === "model.completed") {
-    const io = {};
-    if (typeof data.finalPromptText === "string") io.input = data.finalPromptText;
-    if (Array.isArray(data.assistantTexts) && data.assistantTexts.length > 0) {
-      io.output = data.assistantTexts.join("\n");
+/**
+ * Pure: extract one turn's content from an ordered conversation.
+ *
+ * A trace is a single turn, so we slice the conversation at the last real user
+ * message (`runtimeContextCarrier` messages are per-turn runtime scaffolding,
+ * not the user's prompt) and read only that tail:
+ *
+ *   - `input`  — the user's prompt for this turn.
+ *   - `output` — the last assistant text of the turn (its final answer).
+ *   - `turns`  — one entry per assistant message, in order, so each generation
+ *                can be given its OWN output instead of all of them joined.
+ *                Carries the message's per-call `usage` when the store has it.
+ *   - `toolIO` — `{ [toolCallId]: { name, input, output, isError } }`, matching
+ *                the `toolCallId` on `tool.execution.*` diagnostic events.
+ *
+ * Returns null when nothing usable is found.
+ */
+export function extractTurnContent(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+
+  let start = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg?.role === "user" && msg.runtimeContextCarrier !== true) {
+      start = i;
+      break;
     }
-    return io;
   }
-  if (obj.type === "prompt.submitted" && typeof data.prompt === "string") {
-    return { input: data.prompt };
+  const turn = start >= 0 ? messages.slice(start) : messages;
+  const input = start >= 0 ? blocksToText(messages[start].content) || undefined : undefined;
+
+  const turns = [];
+  const toolIO = {};
+  let output;
+
+  for (const msg of turn) {
+    if (msg?.role === "assistant") {
+      const text = blocksToText(msg.content);
+      const toolCalls = [];
+      if (Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block?.type !== "toolCall" || typeof block.id !== "string") continue;
+          const entry = (toolIO[block.id] ??= {});
+          if (typeof block.name === "string") {
+            entry.name = block.name;
+            toolCalls.push(block.name);
+          }
+          const args = argsToText(block.arguments);
+          if (args !== undefined) entry.input = args;
+        }
+      }
+      turns.push({
+        output: text || (toolCalls.length > 0 ? `→ called: ${toolCalls.join(", ")}` : ""),
+        toolCalls,
+        usage: msg.usage,
+        model: typeof msg.model === "string" ? msg.model : undefined,
+      });
+      if (text) output = text;
+      continue;
+    }
+    if (msg?.role === "toolResult" && typeof msg.toolCallId === "string") {
+      const entry = (toolIO[msg.toolCallId] ??= {});
+      const out = blocksToText(msg.content);
+      if (out) entry.output = out;
+      if (typeof msg.toolName === "string") entry.name ??= msg.toolName;
+      if (typeof msg.isError === "boolean") entry.isError = msg.isError;
+    }
   }
-  return {};
+
+  const hasToolIO = Object.keys(toolIO).length > 0;
+  if (input === undefined && output === undefined && turns.length === 0 && !hasToolIO) {
+    return null;
+  }
+  const out = { turns };
+  if (input !== undefined) out.input = input;
+  if (output !== undefined) out.output = output;
+  if (hasToolIO) out.toolIO = toolIO;
+  return out;
 }
 
 function parseLine(line) {
@@ -80,124 +179,69 @@ function parseLine(line) {
   }
 }
 
-/** Flatten a tool-result `content` value (string | array of text blocks) to text. */
-function contentToText(content) {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    const parts = [];
-    for (const block of content) {
-      if (typeof block === "string") parts.push(block);
-      else if (block && typeof block.text === "string") parts.push(block.text);
-    }
-    if (parts.length > 0) return parts.join("\n");
-  }
-  return undefined;
-}
-
 /**
- * Pure: extract per-tool input/output from trajectory JSONL text, keyed by the
- * tool call id (which matches the `toolCallId` on `tool.execution.*` diagnostic
- * events). We read the LAST `model.completed` entry's `messagesSnapshot`, which
- * is the cumulative conversation and therefore holds every tool call + result of
- * the run by the time the run ends.
- *
- * In the snapshot, tool inputs live on assistant `toolCall` blocks
- * ({ id, name, arguments }) and tool outputs live on `toolResult` messages
- * ({ toolCallId, toolName, content, isError }). Returns a plain object
- * { [toolCallId]: { name, input, output, isError } } or null when none found.
+ * Pure: extract turn content from legacy trajectory JSONL text. The last
+ * `model.completed` entry carries `messagesSnapshot` — the cumulative
+ * conversation in the same message shapes the transcript API returns — so it
+ * goes straight through `extractTurnContent`. Hosts that recorded only
+ * `finalPromptText`/`assistantTexts` fall back to those fields.
  */
-export function extractToolIO(text) {
-  const lines = text.split("\n");
+export function extractFromTrajectory(text) {
   let snapshot;
-  // Walk forward; keep the latest snapshot (cumulative, so last wins).
-  for (const line of lines) {
-    const obj = parseLine(line);
-    if (obj?.type === "model.completed" && Array.isArray(obj?.data?.messagesSnapshot)) {
-      snapshot = obj.data.messagesSnapshot;
-    }
-  }
-  if (!snapshot) return null;
-
-  const byId = {};
-  const ensure = (id) => (byId[id] ??= {});
-  for (const msg of snapshot) {
-    if (!msg || typeof msg !== "object") continue;
-    // Tool outputs: dedicated toolResult messages.
-    if (msg.role === "toolResult" && typeof msg.toolCallId === "string") {
-      const entry = ensure(msg.toolCallId);
-      const out = contentToText(msg.content);
-      if (out !== undefined) entry.output = out;
-      if (typeof msg.toolName === "string") entry.name ??= msg.toolName;
-      if (typeof msg.isError === "boolean") entry.isError = msg.isError;
-      continue;
-    }
-    // Tool inputs: assistant toolCall content blocks.
-    const content = msg.content;
-    if (!Array.isArray(content)) continue;
-    for (const block of content) {
-      if (block?.type !== "toolCall" || typeof block.id !== "string") continue;
-      const entry = ensure(block.id);
-      if (typeof block.name === "string") entry.name = block.name;
-      if (block.arguments !== undefined) {
-        entry.input =
-          typeof block.arguments === "string"
-            ? block.arguments
-            : JSON.stringify(block.arguments);
-      }
-    }
-  }
-  return Object.keys(byId).length > 0 ? byId : null;
-}
-
-/**
- * Pure: extract turn content from trajectory JSONL text. Returns
- * { input, output, sessionInput } where `input`/`output` are the latest turn
- * (for the generation) and `sessionInput` is the first prompt in the text (for
- * trace-level aggregation). Returns null when nothing usable is found.
- */
-export function extractContent(text) {
-  const lines = text.split("\n");
-  let input;
-  let output;
-  let sessionInput;
-  for (const line of lines) {
+  let promptText;
+  let assistantText;
+  for (const line of String(text ?? "").split("\n")) {
     const obj = parseLine(line);
     if (!obj) continue;
-    const io = entryIO(obj);
-    if (io.input !== undefined) {
-      input = io.input;
-      if (sessionInput === undefined) sessionInput = io.input;
+    const data = obj.data;
+    if (obj.type === "model.completed") {
+      if (Array.isArray(data?.messagesSnapshot)) snapshot = data.messagesSnapshot;
+      if (typeof data?.finalPromptText === "string") promptText = data.finalPromptText;
+      if (Array.isArray(data?.assistantTexts) && data.assistantTexts.length > 0) {
+        assistantText = data.assistantTexts.join("\n");
+      }
+    } else if (obj.type === "prompt.submitted" && typeof data?.prompt === "string") {
+      promptText = data.prompt;
     }
-    if (io.output !== undefined) output = io.output;
   }
-  if (input === undefined && output === undefined) return null;
-  const out = {};
-  if (input !== undefined) out.input = input;
-  if (output !== undefined) out.output = output;
-  if (sessionInput !== undefined) out.sessionInput = sessionInput;
+  const fromSnapshot = extractTurnContent(snapshot);
+  if (fromSnapshot) return fromSnapshot;
+  if (promptText === undefined && assistantText === undefined) return null;
+  const out = { turns: assistantText !== undefined ? [{ output: assistantText, toolCalls: [] }] : [] };
+  if (promptText !== undefined) out.input = promptText;
+  if (assistantText !== undefined) out.output = assistantText;
   return out;
 }
 
-/** Read the trajectory text for an event's session (whole file, or tail window
- * for long sessions). Returns { tailText, headText } or null. Never throws. */
-function readTrajectoryText(stateDir, evt, logger) {
+/** Read the tail of a file as UTF-8 text (whole file when small enough). */
+function readTail(file, maxBytes) {
+  const { size } = statSync(file);
+  if (size <= maxBytes) return readFileSync(file, "utf8");
+  const fd = openSync(file, "r");
   try {
-    const sessionId = evt?.sessionId ?? evt?.sessionKey;
+    const buf = Buffer.allocUnsafe(maxBytes);
+    const bytes = readSync(fd, buf, 0, maxBytes, size - maxBytes);
+    return buf.toString("utf8", 0, bytes);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Legacy sidecar read for one session. Returns content or null; never throws. */
+function readLegacyTrajectory(stateDir, ident, logger) {
+  try {
+    const sessionId = ident?.sessionId ?? ident?.sessionKey;
     if (!sessionId) return null;
-    const file = trajectoryPath(stateDir, evt?.agentId, sessionId);
-    const { size } = statSync(file);
-    if (size <= MAX_READ_BYTES) {
-      const whole = readFileSync(file, "utf8");
-      return { tailText: whole, headText: whole };
-    }
-    return {
-      tailText: readWindow(file, MAX_READ_BYTES, "tail"),
-      headText: readWindow(file, HEAD_READ_BYTES, "head"),
-    };
+    const file = trajectoryPath(
+      stateDir,
+      ident?.agentId ?? agentIdFromSessionKey(ident?.sessionKey),
+      sessionId,
+    );
+    return extractFromTrajectory(readTail(file, MAX_READ_BYTES));
   } catch (err) {
-    // File may not exist yet or be mid-write; this is best-effort.
+    // No sidecar on 2026.8+ hosts, or it is mid-write; this is best-effort.
     logger?.debug?.(
-      `langfuse-bridge: could not read transcript (${
+      `langfuse-bridge: no legacy transcript sidecar (${
         err instanceof Error ? err.message : String(err)
       })`,
     );
@@ -206,88 +250,64 @@ function readTrajectoryText(stateDir, evt, logger) {
 }
 
 /**
- * Pure: extract the ordered assistant turns (one per model call) from the latest
- * `model.completed` snapshot. Each assistant message in the conversation is one
- * model call's output: its text, plus the names of any tools it invoked. Used to
- * give each generation its own output (instead of joining them all together).
- * Returns an ordered array of { output, toolCalls } or null.
+ * Load the host's transcript reader. Returns
+ * `(ident) => Promise<messages[] | null>` or null when the running host does
+ * not expose the module (pre-2026.8) — importing it also opens the state
+ * database, which can throw on an unsupported Node/SQLite build, so the import
+ * itself is guarded and a failure just means "use the legacy sidecar".
  */
-export function extractAssistantTurns(text) {
-  const lines = text.split("\n");
-  let snapshot;
-  for (const line of lines) {
-    const obj = parseLine(line);
-    if (obj?.type === "model.completed" && Array.isArray(obj?.data?.messagesSnapshot)) {
-      snapshot = obj.data.messagesSnapshot;
-    }
+export async function loadTranscriptMessageReader(logger) {
+  let read;
+  try {
+    const mod = await import("openclaw/plugin-sdk/session-transcript-runtime");
+    read = mod?.readVisibleSessionTranscriptMessageEntries;
+  } catch (err) {
+    logger?.info?.(
+      `langfuse-bridge: host transcript API unavailable, falling back to the legacy trajectory sidecar (${
+        err instanceof Error ? err.message : String(err)
+      })`,
+    );
+    return null;
   }
-  if (!snapshot) return null;
+  if (typeof read !== "function") {
+    logger?.info?.(
+      "langfuse-bridge: host transcript API unavailable, falling back to the legacy trajectory sidecar",
+    );
+    return null;
+  }
+  return async (ident) => {
+    const sessionId = ident?.sessionId;
+    // The reader resolves a transcript from agentId + sessionId; the session key
+    // is accepted either bare or already agent-scoped (it is not re-prefixed).
+    const agentId = ident?.agentId ?? agentIdFromSessionKey(ident?.sessionKey) ?? "main";
+    if (!sessionId) return null;
+    const params = { sessionId, agentId };
+    if (ident?.sessionKey) params.sessionKey = ident.sessionKey;
+    const entries = await read(params);
+    if (!Array.isArray(entries)) return null;
+    return entries.map((entry) => entry?.message).filter(Boolean);
+  };
+}
 
-  const turns = [];
-  for (const msg of snapshot) {
-    if (msg?.role !== "assistant") continue;
-    const c = msg.content;
-    let text = "";
-    const toolCalls = [];
-    if (typeof c === "string") {
-      text = c;
-    } else if (Array.isArray(c)) {
-      for (const b of c) {
-        if (b?.type === "text" && typeof b.text === "string") {
-          text += (text ? "\n" : "") + b.text;
-        } else if (b?.type === "toolCall" && typeof b.name === "string") {
-          toolCalls.push(b.name);
-        }
+/**
+ * Build the turn-content resolver used by the trace engine. Prefers the host
+ * transcript API and falls back to the legacy sidecar; returns
+ * `async (ident) => content | null` and never throws.
+ */
+export function makeTurnResolver({ stateDir, logger, readMessages } = {}) {
+  return async (ident) => {
+    if (typeof readMessages === "function") {
+      try {
+        const content = extractTurnContent(await readMessages(ident));
+        if (content) return content;
+      } catch (err) {
+        logger?.debug?.(
+          `langfuse-bridge: transcript read failed (${
+            err instanceof Error ? err.message : String(err)
+          })`,
+        );
       }
     }
-    const output = text || (toolCalls.length ? `→ called: ${toolCalls.join(", ")}` : "");
-    turns.push({ output, toolCalls });
-  }
-  return turns.length > 0 ? turns : null;
-}
-
-/**
- * Build a content resolver bound to a state dir. Returns a function that, given
- * a model.usage event, reads the session transcript and returns
- * { input, output, sessionInput } or null. Never throws.
- */
-export function makeContentResolver(stateDir, logger) {
-  return (evt) => {
-    const text = readTrajectoryText(stateDir, evt, logger);
-    if (!text) return null;
-    // For short sessions tail===head (whole file): one pass yields turn + first
-    // prompt. For long sessions: current turn from tail, first prompt from head.
-    const tail = extractContent(text.tailText);
-    if (!tail) return null;
-    if (text.headText === text.tailText) return tail;
-    const head = extractContent(text.headText);
-    return { ...tail, sessionInput: head?.sessionInput ?? tail.input };
-  };
-}
-
-/**
- * Build a tool-I/O resolver bound to a state dir. Returns a function that, given
- * an event with a session id, reads the session transcript and returns the
- * per-tool I/O map { [toolCallId]: { name, input, output, isError } } or null.
- * Always reads the tail (most recent, cumulative snapshot). Never throws.
- */
-export function makeToolIOResolver(stateDir, logger) {
-  return (evt) => {
-    const text = readTrajectoryText(stateDir, evt, logger);
-    if (!text) return null;
-    return extractToolIO(text.tailText);
-  };
-}
-
-/**
- * Build an assistant-turns resolver bound to a state dir. Returns a function
- * that, given an event with a session id, returns the ordered per-call assistant
- * turns ({ output, toolCalls }[]) for the latest model.completed, or null.
- */
-export function makeAssistantTurnsResolver(stateDir, logger) {
-  return (evt) => {
-    const text = readTrajectoryText(stateDir, evt, logger);
-    if (!text) return null;
-    return extractAssistantTurns(text.tailText);
+    return readLegacyTrajectory(stateDir, ident, logger);
   };
 }

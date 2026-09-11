@@ -1,6 +1,6 @@
 {
   "name": "openclaw-x-langfuse-plugin",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Forward OpenClaw model usage diagnostics to Langfuse",
   "type": "module",
   "main": "index.js",
@@ -24,7 +24,7 @@
       "pluginApi": ">=2026.6.1"
     },
     "build": {
-      "openclawVersion": "2026.6.1"
+      "openclawVersion": "2026.9.3"
     },
     "install": {
       "clawhubSpec": "clawhub:openclaw-x-langfuse-plugin",
@@ -60,9 +60,9 @@
   },
   "homepage": "https://github.com/langfuse/openclaw-x-langfuse-plugin#readme",
   "dependencies": {
-    "@langfuse/otel": "^5.9.0",
-    "@langfuse/tracing": "^5.9.0",
+    "@langfuse/otel": "^5.11.0",
+    "@langfuse/tracing": "^5.11.0",
     "@opentelemetry/api": "^1.9.1",
-    "@opentelemetry/sdk-trace-node": "^2.8.0"
+    "@opentelemetry/sdk-trace-node": "^2.11.0"
   }
 }

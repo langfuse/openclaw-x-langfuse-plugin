@@ -1,9 +1,8 @@
 // openclaw-langfuse-bridge
 //
 // Forwards OpenClaw's internal diagnostics bus to Langfuse. It registers a
-// background service, subscribes to the diagnostics event stream, and
-// translates `model.usage` (and `model.call.error`) events into Langfuse
-// traces/generations.
+// background service, subscribes to the diagnostics event stream, and rebuilds
+// each turn as one nested Langfuse trace (see tracer.js).
 //
 // Built on the Langfuse v5 SDK, which is OpenTelemetry-based. To avoid touching
 // OpenClaw's own global OTel setup (the bundled `diagnostics-otel` service), we
@@ -16,8 +15,9 @@
 // privileged capability the runtime injects only for the bundled
 // `diagnostics-otel`/`diagnostics-prometheus` services (it carries captured
 // prompt/response private data); third-party plugins never receive it. The
-// public listener delivers the same event bodies (minus private data), which
-// is all this bridge needs — every field we map lives on the event itself.
+// public listener delivers the same event bodies minus private data — so every
+// structural field we map lives on the event itself, while message content is
+// recovered from the session transcript (see transcript.js).
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import {
@@ -31,11 +31,7 @@ import {
   setLangfuseTracerProvider,
 } from "@langfuse/tracing";
 import { createTraceEngine } from "./tracer.js";
-import {
-  makeContentResolver,
-  makeToolIOResolver,
-  makeAssistantTurnsResolver,
-} from "./transcript.js";
+import { loadTranscriptMessageReader, makeTurnResolver } from "./transcript.js";
 
 const DEFAULT_BASE_URL = "https://cloud.langfuse.com";
 
@@ -101,19 +97,19 @@ function createLangfuseBridgeService(getPluginConfig) {
       const tracing = { startObservation };
 
       // Prompt/response text and tool args/results are not delivered to
-      // third-party plugins (they're private data given only to bundled
-      // services), so we recover them best-effort from OpenClaw's per-session
-      // trajectory transcript under ctx.stateDir to populate observation IO.
-      const resolveContent = makeContentResolver(ctx.stateDir, ctx.logger);
-      const resolveToolIO = makeToolIOResolver(ctx.stateDir, ctx.logger);
-      const resolveTurns = makeAssistantTurnsResolver(ctx.stateDir, ctx.logger);
-
-      engine = createTraceEngine(tracing, {
+      // third-party plugins (they're private data given only to the bundled
+      // diagnostics services), so we recover them best-effort from the session
+      // transcript: via the host's transcript API when it exposes one (SQLite
+      // store, OpenClaw >= 2026.8), else the legacy per-session
+      // `<sessionId>.trajectory.jsonl` sidecar under ctx.stateDir.
+      const readMessages = await loadTranscriptMessageReader(ctx.logger);
+      const resolveTurn = makeTurnResolver({
+        stateDir: ctx.stateDir,
         logger: ctx.logger,
-        resolveContent,
-        resolveToolIO,
-        resolveTurns,
+        readMessages,
       });
+
+      engine = createTraceEngine(tracing, { logger: ctx.logger, resolveTurn });
 
       // `onInternalDiagnosticEvent` invokes the listener as
       // (event, metadata) => void. We only need the event body; the engine
@@ -124,11 +120,13 @@ function createLangfuseBridgeService(getPluginConfig) {
       // Idle reaper: ends observations orphaned by dropped start/complete events
       // (these event types are async-queued and droppable under load). Unref'd
       // so it never keeps the process alive.
-      reaper = setInterval(() => engine?.sweep(), REAPER_INTERVAL_MS);
+      reaper = setInterval(() => void engine?.sweep(), REAPER_INTERVAL_MS);
       reaper.unref?.();
 
       ctx.logger.info(
-        `langfuse-bridge: subscribed to diagnostics; exporting nested run traces to ${baseUrl}`,
+        `langfuse-bridge: subscribed to diagnostics; exporting nested run traces to ${baseUrl} (content source: ${
+          readMessages ? "session transcript API" : "legacy trajectory sidecar"
+        })`,
       );
     },
 
@@ -142,9 +140,10 @@ function createLangfuseBridgeService(getPluginConfig) {
         clearInterval(reaper);
         reaper = null;
       }
-      // End any still-open observations before the provider shuts down.
+      // End any still-open observations before the provider shuts down. This
+      // reads the session transcript to fill in their content, so it is awaited.
       try {
-        engine?.flushAll();
+        await engine?.flushAll();
       } catch {
         // best-effort flush of in-flight observations
       }
